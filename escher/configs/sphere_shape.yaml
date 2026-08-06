@@ -4,21 +4,29 @@
 # The mask from make_target.py (npy or png; npy is the chosen candidate).
 TARGET_MASK: "assets/targets/gingerbread/target.npy"
 
-# Measured at the aligned init: pyramid MSE ~0.6, so weight 1000 puts the mask term at
-# ~600 against chain regs ~1 -- strongly shape-dominant, with the margin hinge (50000)
-# still able to overrule it near a fold.
-MASK_LOSS_WEIGHT: 1000.0
-MASK_PYRAMID_LEVELS: 5
+# Calibrated by grid at the fixed framing (120-step probes, ~20 s each): weight 5000
+# with softened chain regs climbs IoU 0.695 -> 0.75 and perim to ~1.18 with ZERO folds
+# and zero reverts; 1000 barely moves, 10000 gains nothing and starts reverting. The
+# chain weights below override sphere.yaml's SDS-noise-calibrated values: against a
+# deterministic, smooth target the damping is mostly redundant.
+MASK_LOSS_WEIGHT: 5000.0
+MASK_PYRAMID_LEVELS: 7
 # Soft-edge width of the analytic silhouette, in pixels. Gradients live in this band;
-# the pyramid extends their reach.
-MASK_TAU: 2.0
+# the pyramid extends their reach (7 levels: 512 -> 8).
+MASK_TAU: 3.0
+BOUNDARY_SMOOTH_WEIGHT: 300.0
+BOUNDARY_SPACING_WEIGHT: 1000.0
+LR_BOUNDARY: 0.01
 
 # Steps are a solve + one raster (no UNet): hundreds of steps run in minutes.
 SHAPE_STEPS: 400
 
-# Same close-up the SDS isolated pass uses; narrower lunes (larger k) fill less frame,
-# so a k sweep may need this shrunk per-k -- check the step-0 overlay first.
-SHAPE_CAMERA_DISTANCE: 1.7
+# NOT the SDS isolated distance (1.7): there the tile fills the frame, which is good
+# for SDS and fatal for mask matching -- the aligned figure blows up into a frame-
+# filling blob (measured: alignment scale 2.0, IoU 0.876 vs a blob, near-flat loss).
+# The tile must sit INSIDE the frame with margins so the figure's limbs stay visible
+# and the residual bumps give the boundary something to chase.
+SHAPE_CAMERA_DISTANCE: 2.8
 
 # Non-empty (e.g. [4, 6]) runs one shape fit per k into OUTPUT_DIR_k<k> and picks the
 # winner by IoU among certificate-valid runs.

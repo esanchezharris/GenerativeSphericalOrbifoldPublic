@@ -93,8 +93,8 @@ def _hard_iou(a: np.ndarray, b: np.ndarray) -> float:
 def align_mask_to(
     reference: np.ndarray,
     target: np.ndarray,
-    scales: tuple[float, float, int] = (0.7, 1.3, 13),
-    angles_deg: tuple[float, float, int] = (-30.0, 30.0, 13),
+    scales: tuple[float, float, int] = (0.6, 1.3, 15),
+    angles_deg: tuple[float, float, int] = (-90.0, 90.0, 25),
 ) -> tuple[np.ndarray, dict, float]:
     """Place ``target`` over ``reference`` by a similarity transform, maximizing IoU.
 
