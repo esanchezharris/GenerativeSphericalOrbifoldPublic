@@ -295,10 +295,21 @@ class SphereEscher:
         flips = count_flipped_faces(points.detach().cpu().numpy(), self.mesh.faces)
         reverted = False
         if flips > 0 and self._P_good is not None:
-            with torch.no_grad():
-                self.P.copy_(self._P_good)
-            points = self.solve_points()
-            flips = count_flipped_faces(points.detach().cpu().numpy(), self.mesh.faces)
+            # Backtrack toward the last valid state instead of jumping all the way
+            # back: a full revert followed by a fresh lr-sized step re-folds forever on
+            # domains with short chains (the octahedral run froze at 394 consecutive
+            # reverts, momentum reset or not). Accepting the largest valid fraction of
+            # the step turns the fold wall into a surface the optimizer can slide along.
+            proposed = self.P.detach().clone()
+            for alpha in (0.5, 0.25, 0.125, 0.0):
+                with torch.no_grad():
+                    self.P.copy_(self._P_good + alpha * (proposed - self._P_good))
+                points = self.solve_points()
+                flips = count_flipped_faces(
+                    points.detach().cpu().numpy(), self.mesh.faces
+                )
+                if flips == 0:
+                    break
             reverted = True
         if flips == 0:
             self._P_good = self.P.detach().clone()
