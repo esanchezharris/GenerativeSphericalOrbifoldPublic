@@ -1,0 +1,28 @@
+# Deterministic planar shape phase (main_shape_planar.py) -- overlay on base.yaml.
+# Full-mesh deformation (all edge weights through the planar orbifold-Tutte solve)
+# against a fixed silhouette target: the GEM mechanism with a deterministic signal.
+
+# 442 rotation-only pairing: the rotational orbifold closest to the spherical
+# rotation-pair structure, with four pinned corners anchoring scale. Torus is the
+# fallback if the corner pins prove restrictive.
+TILING_TYPE: "OrbifoldI"
+MESH_RESOLUTION: 50
+
+TARGET_MASK: "assets/targets/gingerbread/target.npy"   # same target as the sphere
+MASK_LOSS_WEIGHT: 5000.0     # sphere-calibrated prior; recalibrate by short probe
+MASK_PYRAMID_LEVELS: 7
+MASK_TAU: 3.0
+RENDER_SIZE: 512
+# The frame shows [-h, h]^2. OrbifoldI pins its corners at (+-1, +-1); 2.4 leaves the
+# limbs room to grow into the residual (the tile-fills-frame framing measured as the
+# flat-loss culprit sphere-side transfers directly).
+PLANAR_FRAME_HALF_WIDTH: 2.4
+
+SHAPE_STEPS: 400
+LR_SHAPE: 0.05
+W_REGULARIZATION: 0.02
+SEED: 0
+
+DEVICE: "cpu"                # the solve is CPU; cuda only accelerates the mask field
+OUTPUT_DIR: "output/planar_shape"
+VISUALIZATION_FREQ: 25
