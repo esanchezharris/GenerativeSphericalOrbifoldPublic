@@ -52,6 +52,38 @@ def test_set_step_range_moves_the_sampling_window():
     assert (g.min_step, g.max_step) == (20, 500)
 
 
+def test_arm_sds_arms_clip_and_anneal():
+    from omegaconf import OmegaConf
+
+    from escher.guidance.schedule import arm_sds
+
+    g = bare_guidance(grad_clip=[0, 2.0, 8.0, 1000])
+    args = OmegaConf.create(
+        {"SDS_ANNEAL_END": 800, "SDS_MAX_START": 0.98, "SDS_MAX_END": 0.5}
+    )
+    arm_sds(g, args, 400)
+    assert g.grad_clip_val == pytest.approx(2.0 + 6.0 * 0.4)
+    assert g.min_step == 20  # cfg.min_step_percent default 0.02
+    assert g.max_step == int(1000 * 0.74)
+
+
+def test_arm_sds_tolerates_guidance_without_step_range():
+    """DeepFloyd has update_step but no set_step_range; arm_sds must not crash."""
+    from omegaconf import OmegaConf
+
+    from escher.guidance.schedule import arm_sds
+
+    class Stub:
+        armed = None
+
+        def update_step(self, epoch, global_step):
+            self.armed = global_step
+
+    s = Stub()
+    arm_sds(s, OmegaConf.create({"SDS_ANNEAL_END": 800}), 5)
+    assert s.armed == 5
+
+
 def test_texture_tv_prior():
     import torch
 

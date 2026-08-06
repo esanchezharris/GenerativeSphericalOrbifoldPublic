@@ -17,8 +17,18 @@ from escher.OTE.core.OTESolver import Constraints
 import imageio
 from typing import List
 OUTPUT_DIR = ""
-glctx = dr.RasterizeCudaContext()
 from time import time
+
+# Created lazily: a CUDA context at IMPORT time made `import escher.main` impossible on
+# CPU (tests, the deterministic planar shape phase) and on GPU-less machines.
+_glctx = None
+
+
+def _get_glctx():
+    global _glctx
+    if _glctx is None:
+        _glctx = dr.RasterizeCudaContext()
+    return _glctx
 
 
 def _render_tiling_same_color(V, UV, T, texture, constraints: Constraints, R, grid_size=4):
@@ -38,7 +48,7 @@ def _render_tiling_same_color(V, UV, T, texture, constraints: Constraints, R, gr
     rT = torch.concat(rT, axis=0)
     rUV = torch.concat(rUV, axis=0)
     img, _ = render_mesh_nvdiffrast(
-        vertices=rV, uv=rUV, faces=rT, texture=texture, image_size=1024 if grid_size <= 4 else 2048, glctx=glctx
+        vertices=rV, uv=rUV, faces=rT, texture=texture, image_size=1024 if grid_size <= 4 else 2048, glctx=_get_glctx()
     )
     return img
 
@@ -123,7 +133,7 @@ def debug_code_for_infinite_video():
         texture=None,
         vertices_color=torch.Tensor([[0, 0, 1.0], [0, 0, 1.0], [0, 0, 1.0], [0, 0, 1.0]]).cuda(),
         image_size=1024 if grid_size <= 4 else 2048,
-        glctx=glctx,
+        glctx=_get_glctx(),
     )
     mask = img[:, :, :, 3:]
     img_color = img[:, :, :, :3]
@@ -221,7 +231,7 @@ def _render_tiling_different_colors(
                     uv=UV,
                     texture=c_texture,
                     image_size=1024 if grid_size <= 4 else 2048,
-                    glctx=glctx,
+                    glctx=_get_glctx(),
                 )
                 mask = img[:, :, :, 3:]
                 if set_first_to_zero:

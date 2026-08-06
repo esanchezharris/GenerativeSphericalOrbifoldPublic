@@ -7,7 +7,16 @@ import nvdiffrast.torch as dr
 
 
 OUTPUT_DIR = ""
-glctx = dr.RasterizeCudaContext()
+# Created lazily: a CUDA context at IMPORT time made `import escher.main` impossible on
+# CPU (tests, the deterministic planar shape phase) and on GPU-less machines.
+_glctx = None
+
+
+def _get_glctx():
+    global _glctx
+    if _glctx is None:
+        _glctx = dr.RasterizeCudaContext()
+    return _glctx
 
 
 def save_img(img, path):
@@ -44,7 +53,7 @@ def render_from_path(obj_path, material_path, center_and_normalize=True):
         mv=mv,
         proj=proj,
         image_size=(512, 512),
-        glctx=glctx,
+        glctx=_get_glctx(),
         texture=texture,
         vertices_color=None,
     )  #

@@ -67,15 +67,9 @@ def texture_tv(texture: torch.Tensor) -> torch.Tensor:
     return dx.square().mean() + dy.square().mean()
 
 
-def annealed_max_step(args, iteration: int) -> float:
-    """Linear anneal of the SDS max-timestep fraction over ``[0, SDS_ANNEAL_END]``.
-
-    High timesteps make layout-scale edits; low ones refine detail. Annealing the
-    ceiling downward moves SDS from composing the figure to polishing it, instead of
-    letting late high-noise samples keep repainting a texture that is already right.
-    """
-    t = min(max(iteration / max(args.SDS_ANNEAL_END, 1), 0.0), 1.0)
-    return float(args.SDS_MAX_START + (args.SDS_MAX_END - args.SDS_MAX_START) * t)
+# Shared with the planar pipeline; re-exported here because tests and older call sites
+# import them from main_sphere.
+from escher.guidance.schedule import annealed_max_step, arm_sds  # noqa: E402,F401
 
 
 class SphereEscher:
@@ -464,14 +458,8 @@ class SphereEscher:
         if a.CLAMP_TEXTURE:
             self.texture.data.clamp_(0.0, 1.0)
 
-        # Arm the SDS grad-clip schedule. threestudio's trainer calls update_step() every
-        # iteration; nothing in this repo (or upstream main.py) ever did, so grad_clip_val
-        # stayed None and CLIP_GRADIENTS_IN_SDS was silently a no-op in every run to date.
-        self.guidance.update_step(0, iteration)
-        if a.get("SDS_ANNEAL_END", 0) > 0:
-            self.guidance.set_step_range(
-                self.guidance.cfg.min_step_percent, annealed_max_step(a, iteration)
-            )
+        # Grad-clip arming + timestep-window anneal (escher/guidance/schedule.py).
+        arm_sds(self.guidance, a, iteration)
 
         frozen = self.shape_frozen(iteration)
 
