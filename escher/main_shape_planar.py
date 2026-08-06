@@ -154,7 +154,12 @@ def shape_step(escher, optimizer, target, ctx: PlanarShapeContext, args) -> dict
     boundary = mapped[ctx.loop]
     perimeter = (boundary.roll(-1, 0) - boundary).norm(dim=-1).sum()
     reg = args.W_REGULARIZATION * (escher.W**2).sum()
-    reg = reg + args.PERIMETER_WEIGHT * torch.relu(perimeter - ctx.perimeter0)
+    # Slack matters: the figure's outline is legitimately LONGER than the undeformed
+    # square (hinging at perimeter0 exactly froze the run at IoU 0.685); the hinge only
+    # exists to make runaway tendrils expensive.
+    reg = reg + args.PERIMETER_WEIGHT * torch.relu(
+        perimeter - args.PERIMETER_SLACK * ctx.perimeter0
+    )
     if args.EQUAL_AREA_WEIGHT_2D > 0:
         areas = planar_face_areas(mapped, escher.faces)
         reg = reg + args.EQUAL_AREA_WEIGHT_2D * (

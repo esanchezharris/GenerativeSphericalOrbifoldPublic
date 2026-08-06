@@ -26,7 +26,10 @@ W_REGULARIZATION: 0.02
 # hinge only charges for length BEYOND the undeformed tile's; drift keeps faces near
 # their initial areas, the planar twin of the sphere's equal-area barrier.
 PERIMETER_WEIGHT: 100.0
-EQUAL_AREA_WEIGHT_2D: 100.0
+# The figure's outline is legitimately longer than the square; hinging at exactly
+# perimeter0 froze the run at IoU 0.685. Free growth up to 1.6x, expensive beyond.
+PERIMETER_SLACK: 1.6
+EQUAL_AREA_WEIGHT_2D: 50.0
 SEED: 0
 
 DEVICE: "cpu"                # the solve is CPU; cuda only accelerates the mask field
