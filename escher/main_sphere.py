@@ -36,7 +36,11 @@ from omegaconf import OmegaConf
 
 from escher.OTE.core.spherical.differentiable import SphericalEmbedder
 from escher.OTE.tilings_sphere import DihedralOrbifold
-from escher.geometry.spherical_sanity_checks import check_covers_sphere_once, count_flipped_faces
+from escher.geometry.spherical_sanity_checks import (
+    boundary_arc_ratio,
+    check_covers_sphere_once,
+    count_flipped_faces,
+)
 from escher.rendering.camera import orbit_views, tile_centric_views
 from escher.rendering.render_sphere_nvdiffrast import build_tiled_sphere, render_tiled_sphere
 
@@ -275,6 +279,7 @@ class SphereEscher:
         return {
             "loss": total_loss,
             "silhouette": sil,
+            "boundary_ratio": self.boundary_ratio(points),
             "timestep": float(timestep.float().mean()),
             "energy": self.embedder.last_result.energy,
             "solver_iters": (
@@ -285,6 +290,33 @@ class SphereEscher:
         }
 
     # ------------------------------------------------------------------- diagnostics
+    def boundary_ratio(self, points: torch.Tensor) -> float:
+        """Tile perimeter relative to the undeformed lune -- see
+        :func:`~escher.geometry.spherical_sanity_checks.boundary_arc_ratio`."""
+        return boundary_arc_ratio(
+            points.detach().cpu().numpy(),
+            self.mesh.points,
+            (self.mesh.left, self.mesh.right, self.mesh.bottom),
+        )
+
+    def log_metrics(self, iteration: int, info: dict) -> None:
+        """Append one row to ``metrics.csv``.
+
+        Written by the process itself rather than scraped from stdout: a previous run's log
+        was piped through a tail-only filter at launch and the history was lost, taking the
+        matched-step comparison with it.
+        """
+        path = self.output_dir / "metrics.csv"
+        new = not path.exists()
+        with open(path, "a", encoding="utf-8") as f:
+            if new:
+                f.write("step,loss,silhouette,karcher,boundary_ratio,solver_iters\n")
+            f.write(
+                f"{iteration},{info['loss']:.4f},{info['silhouette']:.4f},"
+                f"{info['energy']:.6f},{info['boundary_ratio']:.6f},"
+                f"{info['solver_iters']}\n"
+            )
+
     def check_geometry(self, points: torch.Tensor) -> tuple[bool, str]:
         """Is the current tile still a valid, fold-free tiling?"""
         pts = points.detach().cpu().numpy()
@@ -294,21 +326,23 @@ class SphereEscher:
     def save_checkpoint(self, iteration: int) -> Path:
         """Persist everything needed to re-render or resume.
 
-        The optimised state is small (edge weights plus one texture), so this is cheap and
-        worth doing often -- a run is ~25 minutes and snapshots alone cannot be reloaded.
+        Writes a step-tagged file **and** updates ``checkpoint.pt``. Earlier runs kept only
+        the latter, overwriting it each time, which made it impossible to compare two runs at
+        a matched step after the fact -- the state had already been overwritten by the time
+        the comparison was wanted. The state is small (edge weights plus one texture), so
+        keeping every snapshot costs little.
         """
-        path = self.output_dir / "checkpoint.pt"
-        torch.save(
-            {
-                "iteration": iteration,
-                "W": self.W.detach().cpu(),
-                "texture": self.texture.detach().cpu(),
-                "optimizer": self.optimizer.state_dict(),
-                "config": OmegaConf.to_container(self.args, resolve=True),
-            },
-            path,
-        )
-        return path
+        payload = {
+            "iteration": iteration,
+            "W": self.W.detach().cpu(),
+            "texture": self.texture.detach().cpu(),
+            "optimizer": self.optimizer.state_dict(),
+            "config": OmegaConf.to_container(self.args, resolve=True),
+        }
+        tagged = self.output_dir / f"checkpoint_{iteration:06d}.pt"
+        torch.save(payload, tagged)
+        torch.save(payload, self.output_dir / "checkpoint.pt")
+        return tagged
 
     def load_checkpoint(self, path: str | Path) -> int:
         state = torch.load(path, map_location="cpu", weights_only=False)
@@ -379,16 +413,17 @@ class SphereEscher:
             info = self.step(iteration)
 
             if iteration % 10 == 0:
+                self.log_metrics(iteration, info)
                 elapsed = time.time() - start
-                per_step = elapsed / max(iteration, 1)
+                per_step = elapsed / max(iteration - first_step, 1)
                 mem = torch.cuda.max_memory_allocated() / 2**30
-                sil = (
-                    f"sil {info['silhouette']:9.1f} | " if info.get("silhouette") else ""
-                )
                 print(
-                    f"step {iteration:5d} | loss {info['loss']:9.1f} | {sil}"
-                    f"karcher {info['energy']:8.4f} | solver {info['solver_iters']:3d} it | "
-                    f"{per_step:5.2f} s/step | {mem:4.1f} GiB"
+                    f"step {iteration:5d} | loss {info['loss']:9.1f} | "
+                    f"sil {info['silhouette']:8.1f} | karcher {info['energy']:7.4f} | "
+                    f"perim {info['boundary_ratio']:6.4f}x | "
+                    f"solver {info['solver_iters']:3d} it | "
+                    f"{per_step:5.2f} s/step | {mem:4.1f} GiB",
+                    flush=True,
                 )
 
             if iteration % a.VISUALIZATION_FREQ == 0:

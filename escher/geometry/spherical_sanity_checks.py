@@ -28,11 +28,35 @@ from __future__ import annotations
 import numpy as np
 
 __all__ = [
+    "boundary_arc_length",
+    "boundary_arc_ratio",
     "count_flipped_faces",
     "signed_solid_angles",
     "total_solid_angle",
     "check_covers_sphere_once",
 ]
+
+
+def boundary_arc_length(points: np.ndarray, chain: np.ndarray) -> float:
+    """Geodesic length of the polyline through ``chain``, in radians."""
+    p = _as_unit(np.asarray(points)[np.asarray(chain)])
+    cos = np.clip(np.einsum("ij,ij->i", p[:-1], p[1:]), -1.0, 1.0)
+    return float(np.arccos(cos).sum())
+
+
+def boundary_arc_ratio(
+    points: np.ndarray, reference: np.ndarray, chains
+) -> float:
+    """Tile perimeter relative to the undeformed domain's.
+
+    **The discriminator for a real Escher tiling.** A figure-shaped outline is far longer
+    than the smooth boundary it started from, so a ratio near 1.0 means the figure is merely
+    painted onto an undeformed tile, however convincing the texture looks. Cheap enough to
+    log every step, and it answers the question the renders cannot.
+    """
+    now = sum(boundary_arc_length(points, c) for c in chains)
+    before = sum(boundary_arc_length(reference, c) for c in chains)
+    return now / max(before, 1e-12)
 
 FULL_SPHERE = 4.0 * np.pi
 

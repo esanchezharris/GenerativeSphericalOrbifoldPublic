@@ -21,6 +21,8 @@ from escher.geometry.sphere_tiler import rotation_matrix
 from escher.geometry.spherical_base_mesh import get_lune_mesh
 from escher.geometry.spherical_sanity_checks import (
     FULL_SPHERE,
+    boundary_arc_length,
+    boundary_arc_ratio,
     check_covers_sphere_once,
     count_flipped_faces,
     total_solid_angle,
@@ -258,6 +260,42 @@ def test_solved_equator_arc_folds_onto_itself(k):
 
 
 # ---------------------------------------------------------------------------- laplacian
+def test_boundary_arc_ratio_is_one_for_the_undeformed_domain():
+    mesh = get_lune_mesh(k=4, n_theta=12, n_phi=9)
+    chains = (mesh.left, mesh.right, mesh.bottom)
+    assert boundary_arc_ratio(mesh.points, mesh.points, chains) == pytest.approx(1.0)
+
+
+def test_boundary_arc_ratio_grows_with_a_wigglier_outline():
+    """The discriminator for a real Escher tiling: a figure-shaped outline is much longer
+    than the smooth boundary it started from."""
+    mesh = get_lune_mesh(k=4, n_theta=12, n_phi=9)
+    chains = (mesh.left, mesh.right, mesh.bottom)
+    rng = np.random.default_rng(0)
+
+    ratios = []
+    for scale in (0.02, 0.05, 0.10):
+        p = mesh.points.copy()
+        interior = mesh.left[1:-1]
+        p[interior] += rng.normal(scale=scale, size=(len(interior), 3))
+        p /= np.linalg.norm(p, axis=1, keepdims=True)
+        ratios.append(boundary_arc_ratio(p, mesh.points, chains))
+
+    assert all(r > 1.0 for r in ratios)
+    assert ratios == sorted(ratios), "a wigglier boundary must score higher"
+
+
+def test_boundary_arc_length_of_a_quarter_great_circle():
+    """Sanity-check the units: pole to equator along a meridian is pi/2 radians."""
+    pts = np.stack(
+        [
+            np.array([np.sin(t), 0.0, np.cos(t)])
+            for t in np.linspace(0, np.pi / 2, 200)
+        ]
+    )
+    assert boundary_arc_length(pts, np.arange(len(pts))) == pytest.approx(np.pi / 2, rel=1e-4)
+
+
 def test_laplacian_convention():
     edges = np.array([[0, 1], [1, 2]])
     L = laplacian_from_edges(edges, np.array([2.0, 3.0]), 3).toarray()
