@@ -860,10 +860,15 @@ class Escher:
                     self.uv[0, ...].cpu().detach().numpy(),
                     texture_image=texture_img,  # (H, W, C)
                 )
-                render_from_path(
-                    os.path.join(self.args.OUTPUT_DIR, f"final_mesh.obj"),
-                    os.path.join(self.args.OUTPUT_DIR, f"material_0.png"),
-                )
+                try:
+                    render_from_path(
+                        os.path.join(self.args.OUTPUT_DIR, f"final_mesh.obj"),
+                        os.path.join(self.args.OUTPUT_DIR, f"material_0.png"),
+                    )
+                except AttributeError as exc:
+                    # newer libigl builds dropped igl.read_obj; this re-render of the
+                    # just-saved OBJ is a nicety, not a dependency -- keep training.
+                    print(f"render_from_path skipped: {exc}")
                 # pickle everything i need to reproduce these visualizations later, int OUTPUT DIR
 
         if make_videos:
