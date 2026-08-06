@@ -399,6 +399,11 @@ class SphereEscher:
         if a.CLAMP_TEXTURE:
             self.texture.data.clamp_(0.0, 1.0)
 
+        # Arm the SDS grad-clip schedule. threestudio's trainer calls update_step() every
+        # iteration; nothing in this repo (or upstream main.py) ever did, so grad_clip_val
+        # stayed None and CLIP_GRADIENTS_IN_SDS was silently a no-op in every run to date.
+        self.guidance.update_step(0, iteration)
+
         frozen = self.shape_frozen(iteration)
 
         # Validity projection BEFORE anything uses this step's geometry.

@@ -343,3 +343,12 @@ class StableDiffusion(nn.Module):
         # http://arxiv.org/abs/2303.15413
         if self.cfg.grad_clip is not None:
             self.grad_clip_val = C(self.cfg.grad_clip, epoch, global_step)
+
+    def set_step_range(self, min_percent: float, max_percent: float) -> None:
+        """Move the SDS timestep sampling window; ``train_step`` reads these per call.
+
+        Annealing ``max_percent`` downward over training shifts SDS from layout-scale
+        edits (high noise) to detail refinement (low noise).
+        """
+        self.min_step = int(self.num_train_timesteps * min_percent)
+        self.max_step = int(self.num_train_timesteps * max_percent)
