@@ -5,6 +5,7 @@ groups. Here the symmetry groups are the finite rotation groups of the sphere.
 """
 
 from escher.OTE.tilings_sphere.dihedral import DihedralOrbifold
+from escher.OTE.tilings_sphere.octahedral import OctahedralOrbifold
 from escher.OTE.tilings_sphere.sparse_system_3d import SparseSystem3D
 
-__all__ = ["DihedralOrbifold", "SparseSystem3D"]
+__all__ = ["DihedralOrbifold", "OctahedralOrbifold", "SparseSystem3D"]

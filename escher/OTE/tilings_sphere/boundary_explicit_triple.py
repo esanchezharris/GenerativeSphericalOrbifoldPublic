@@ -31,7 +31,34 @@ from escher.geometry.spherical_kite_mesh import KiteMesh, get_kite_mesh
 
 from .sparse_system_3d import SparseSystem3D
 
-__all__ = ["BoundaryExplicitTriple", "clamped_cotan_weights"]
+__all__ = ["BoundaryExplicitTriple", "clamped_cotan_weights", "cut_rotations"]
+
+
+def cut_rotations(mesh) -> tuple[np.ndarray, np.ndarray]:
+    """The two cut rotations of a kite mesh, signs resolved numerically and VERIFIED.
+
+    ``R1`` about cone 1 by :math:`2\\pi/p_1` maps ``left1 -> right1``; ``R2`` about
+    cone 3 by :math:`2\\pi/p_3` maps ``left2 -> right2``. The reference derives the same
+    rotations by Procrustes from the endpoint positions (``CutBoundaryPiece.setR``);
+    here they are analytic, with the same exactness assertion. Shared by the
+    boundary-explicit and weights-mode (``OctahedralOrbifold``) constraint systems.
+    """
+    corners = mesh.metadata["corners"]
+    c1, c2a, c3, c2b = corners
+    orders = mesh.cone_orders
+
+    def one(axis, order):
+        for sign in (1.0, -1.0):
+            R = rotation_matrix(axis, sign * 2 * np.pi / order)
+            if np.allclose(R @ c2a, c2b, atol=1e-9):
+                return R
+        raise AssertionError("no cone rotation maps cone2a to cone2b")
+
+    R1 = one(c1, orders[0])
+    R2 = one(c3, orders[2])
+    assert np.abs(mesh.points[mesh.left1] @ R1.T - mesh.points[mesh.right1]).max() < 1e-9
+    assert np.abs(mesh.points[mesh.left2] @ R2.T - mesh.points[mesh.right2]).max() < 1e-9
+    return R1, R2
 
 
 def clamped_cotan_weights(mesh) -> np.ndarray:
@@ -70,21 +97,7 @@ class BoundaryExplicitTriple:
         cls, cone_orders: tuple[int, int, int] = (2, 3, 4), n: int = 20
     ) -> "BoundaryExplicitTriple":
         mesh = get_kite_mesh(cone_orders, n=n)
-        corners = mesh.metadata["corners"]
-        c1, c2a, c3, c2b = corners
-
-        def cut_rotation(axis, order):
-            for sign in (1.0, -1.0):
-                R = rotation_matrix(axis, sign * 2 * np.pi / order)
-                if np.allclose(R @ c2a, c2b, atol=1e-9):
-                    return R
-            raise AssertionError("no cone rotation maps cone2a to cone2b")
-
-        R1 = cut_rotation(c1, cone_orders[0])
-        R2 = cut_rotation(c3, cone_orders[2])
-        # the reference's setR asserts the same property via Procrustes
-        assert np.abs(mesh.points[mesh.left1] @ R1.T - mesh.points[mesh.right1]).max() < 1e-9
-        assert np.abs(mesh.points[mesh.left2] @ R2.T - mesh.points[mesh.right2]).max() < 1e-9
+        R1, R2 = cut_rotations(mesh)
 
         pin_order: list[int] = []
         roles: list[tuple[str, int]] = []

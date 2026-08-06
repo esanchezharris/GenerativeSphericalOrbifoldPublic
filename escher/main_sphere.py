@@ -119,9 +119,17 @@ class SphereEscher:
                 warm_start=a.WARM_START,
             )
         else:
-            self.orbifold = DihedralOrbifold.from_resolution(
-                k=a.ORBIFOLD_K, n_theta=a.MESH_N_THETA, n_phi=a.MESH_N_PHI
-            )
+            cones = a.get("ORBIFOLD_CONES", None)
+            if cones:
+                from escher.OTE.tilings_sphere import OctahedralOrbifold
+
+                self.orbifold = OctahedralOrbifold.from_resolution(
+                    tuple(int(c) for c in cones), n=a.KITE_N
+                )
+            else:
+                self.orbifold = DihedralOrbifold.from_resolution(
+                    k=a.ORBIFOLD_K, n_theta=a.MESH_N_THETA, n_phi=a.MESH_N_PHI
+                )
             self.mesh = self.orbifold.mesh
             self.tiler = self.orbifold.tiler()
             self.embedder = SphericalEmbedder(
