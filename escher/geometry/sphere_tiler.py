@@ -185,6 +185,15 @@ class SphericalTiler:
         tile_index = np.repeat(np.arange(self.order), len(faces))
         return tiled, all_faces, tile_index
 
+    def tile_attribute(self, values: np.ndarray) -> np.ndarray:
+        """Repeat a per-vertex attribute once per group element: ``(n, d)`` -> ``(|G|*n, d)``.
+
+        Used for texture coordinates. Because every copy repeats the *same* UVs, all ``|G|``
+        tiles sample one shared texture -- which is exactly what makes the result a tiling of
+        a single figure rather than independently textured patches.
+        """
+        return np.tile(np.asarray(values), (self.order, 1))
+
     def tile_edges(self, points: np.ndarray, edges: np.ndarray) -> np.ndarray:
         """Replicate an edge set. Returns ``(|G| * n_edges, 2, 3)`` line segments."""
         points = np.asarray(points, dtype=np.float64)

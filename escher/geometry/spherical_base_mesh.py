@@ -38,6 +38,15 @@ class LuneMesh:
     bottom: np.ndarray  #: equator arc, from ``left[-1]`` to ``right[-1]``
     pole: int  #: index of the k-fold cone point
     bottom_mid: int  #: index of the 2-fold cone point at the middle of the equator arc
+    uv: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
+    """``(n, 2)`` texture coordinates in ``[0, 1]^2``.
+
+    Defined on the *fundamental domain*, and deliberately not recomputed after the solver
+    deforms the mesh: every tile is the same copy of this domain, so replicating these UVs
+    across the group makes all ``2k`` tiles sample one shared texture. That is what makes the
+    result a tiling of a single figure rather than ``2k`` unrelated patches.
+    """
+
     k: int = 4
     metadata: dict = field(default_factory=dict)
 
@@ -100,11 +109,20 @@ def get_lune_mesh(k: int = 4, n_theta: int = 24, n_phi: int = 16) -> LuneMesh:
     colatitudes = np.linspace(0.0, np.pi / 2, n_theta + 1)[1:]
 
     points = [np.array([0.0, 0.0, 1.0])]  # pole
+    # UV runs across the lune in u and from pole to equator in v. The pole is a single
+    # vertex where every longitude coincides, so it takes the midpoint of the u range.
+    uv = [np.array([0.5, 0.0])]
     ring_start = []
-    for theta in colatitudes:
+    for ring, theta in enumerate(colatitudes, start=1):
         ring_start.append(len(points))
         points.extend(_spherical_to_cartesian(np.full(n_phi, theta), longitudes))
+        uv.extend(
+            np.stack(
+                [np.linspace(0.0, 1.0, n_phi), np.full(n_phi, ring / n_theta)], axis=1
+            )
+        )
     points = np.stack(points)
+    uv = np.stack(uv)
     pole = 0
 
     faces = []
@@ -134,6 +152,7 @@ def get_lune_mesh(k: int = 4, n_theta: int = 24, n_phi: int = 16) -> LuneMesh:
         bottom=bottom,
         pole=pole,
         bottom_mid=bottom_mid,
+        uv=uv,
         k=k,
         metadata={"n_theta": n_theta, "n_phi": n_phi, "half_width": half_width},
     )
