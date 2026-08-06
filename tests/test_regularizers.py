@@ -95,6 +95,65 @@ def test_loss_is_differentiable_wrt_points(lune):
     assert pts.grad.abs().sum() > 0
 
 
+# ----------------------------------------------------------------------- tail term
+def test_tail_term_targets_localized_collapse_better_than_the_mean(lune):
+    """The reason the tail term exists: collapse a small cluster of faces and the tail
+    statistic must react far more strongly than the mean, so the barrier can be strong
+    against degeneracy without taxing global deformation."""
+    from escher.OTE.core.spherical.regularizers import area_tail_loss
+
+    faces = torch.as_tensor(lune.faces, dtype=torch.long)
+    ref = spherical_face_areas(as_t(lune.points), faces).detach()
+
+    # squeeze one small vertex neighbourhood toward a point -- a localized collapse.
+    # Select by k-nearest rather than by radius: on a coarse test mesh a fixed radius can
+    # capture only the victim itself, silently making the "collapse" a no-op.
+    p = lune.points.copy()
+    victim = lune.points[40]
+    near = np.argsort(np.linalg.norm(lune.points - victim, axis=1))[:9]
+    p[near] = victim + 0.05 * (p[near] - victim)
+    p /= np.linalg.norm(p, axis=1, keepdims=True)
+    assert np.abs(p - lune.points).max() > 1e-3, "collapse must actually move vertices"
+
+    mean_after = float(equal_area_loss(as_t(p), faces, ref))
+    tail_after = float(area_tail_loss(as_t(p), faces, ref))
+
+    assert tail_after > 1.0, "collapsed faces must register strongly in the tail"
+    # Discrimination at the damaged state: the tail statistic concentrates on the worst 5%
+    # of faces while the mean dilutes the same damage across all of them, so for localized
+    # collapse the tail must exceed the mean by a large factor.
+    assert tail_after > 5.0 * mean_after, f"tail {tail_after:.3f} vs mean {mean_after:.3f}"
+
+
+def test_tail_term_is_differentiable(lune):
+    from escher.OTE.core.spherical.regularizers import area_tail_loss
+
+    faces = torch.as_tensor(lune.faces, dtype=torch.long)
+    ref = spherical_face_areas(as_t(lune.points), faces).detach()
+    rng = np.random.default_rng(5)
+    p = lune.points + 0.04 * rng.normal(size=lune.points.shape)
+    p /= np.linalg.norm(p, axis=1, keepdims=True)
+
+    pts = as_t(p).requires_grad_(True)
+    area_tail_loss(pts, faces, ref).backward()
+    assert torch.isfinite(pts.grad).all()
+    assert pts.grad.abs().sum() > 0
+
+
+def test_tail_term_ignores_uniform_deformation(lune):
+    """Uniform drift moves mean and tail identically; the tail's advantage is only about
+    LOCALIZED damage. Verify a uniform area change costs the tail no more than ~the mean."""
+    from escher.OTE.core.spherical.regularizers import area_tail_loss
+
+    faces = torch.as_tensor(lune.faces, dtype=torch.long)
+    ref = spherical_face_areas(as_t(lune.points), faces).detach()
+    # uniform drift: scale every reference down 10% => every face ratio = 1/0.9
+    shrunk_ref = ref * 0.9
+    mean_v = float(equal_area_loss(as_t(lune.points), faces, shrunk_ref))
+    tail_v = float(area_tail_loss(as_t(lune.points), faces, shrunk_ref))
+    assert tail_v == pytest.approx(mean_v, rel=1e-6)
+
+
 # ------------------------------------------------- the property that earns the GPU run
 def test_regularizer_steers_weights_back_toward_uniform_through_the_solve():
     """Distort the embedding via non-uniform weights, then minimize ONLY the equal-area

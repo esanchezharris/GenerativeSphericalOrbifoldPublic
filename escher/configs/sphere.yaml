@@ -49,7 +49,13 @@ PREVIEW_DISTANCE: 3.0
 # drift from the undeformed lune) measures 0.14 at the start, 0.83 at the healthy 7000-step
 # run, and 32.2 at the degenerate strong-silhouette run -- a 39x gap. Weight 2000 makes the
 # term mild (~1.7k) against healthy deformation and dominant (~64k) against degeneracy.
-EQUAL_AREA_WEIGHT: 2000.0
+# Weight-dialing the mean term alone failed in BOTH directions (2000 ran away at step 1030,
+# 5000 pulled the shape back to the lune), so the barrier is split: a gentle mean term plus
+# a strong tail term on the worst 5% of faces. Calibrated per-state values (mean / tail):
+# start 0.14/0.31 -- healthy 1.58/12.6 -- alerted 2.98/27.6 -- degenerate 32.2/485.
+EQUAL_AREA_WEIGHT: 500.0
+AREA_TAIL_WEIGHT: 800.0
+AREA_TAIL_FRACTION: 0.05
 # Upstream parity: main.py line 615 adds W_REGULARIZATION * sum(W^2) every step. Degenerate
 # configurations need sigmoid saturation (large raw W: 68k at the degenerate run vs 11k
 # healthy), so this is a gentle extra prior on top of the area term.

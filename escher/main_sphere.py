@@ -35,7 +35,11 @@ import torch
 from omegaconf import OmegaConf
 
 from escher.OTE.core.spherical.differentiable import SphericalEmbedder
-from escher.OTE.core.spherical.regularizers import equal_area_loss, spherical_face_areas
+from escher.OTE.core.spherical.regularizers import (
+    area_tail_loss,
+    equal_area_loss,
+    spherical_face_areas,
+)
 from escher.OTE.tilings_sphere import DihedralOrbifold
 from escher.geometry.spherical_sanity_checks import (
     boundary_arc_ratio,
@@ -281,6 +285,10 @@ class SphereEscher:
             if a.EQUAL_AREA_WEIGHT > 0:
                 reg = reg + a.EQUAL_AREA_WEIGHT * equal_area_loss(
                     points, self.faces_t, self.ref_areas
+                )
+            if a.AREA_TAIL_WEIGHT > 0:
+                reg = reg + a.AREA_TAIL_WEIGHT * area_tail_loss(
+                    points, self.faces_t, self.ref_areas, fraction=a.AREA_TAIL_FRACTION
                 )
             if a.W_REGULARIZATION > 0:
                 reg = reg + a.W_REGULARIZATION * (self.W**2).sum()

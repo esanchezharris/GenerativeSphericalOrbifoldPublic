@@ -21,7 +21,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-__all__ = ["equal_area_loss", "spherical_face_areas"]
+__all__ = ["area_tail_loss", "equal_area_loss", "spherical_face_areas"]
 
 
 def spherical_face_areas(points: Tensor, faces: Tensor) -> Tensor:
@@ -51,3 +51,27 @@ def equal_area_loss(points: Tensor, faces: Tensor, reference_areas: Tensor) -> T
     """
     areas = spherical_face_areas(points, faces)
     return ((areas / reference_areas - 1.0) ** 2).mean()
+
+
+def area_tail_loss(
+    points: Tensor, faces: Tensor, reference_areas: Tensor, fraction: float = 0.05
+) -> Tensor:
+    r"""Mean squared area drift of the **worst** ``fraction`` of faces.
+
+    Why the mean term alone cannot work, measured across two runs: with a weak mean
+    (EA_W=2000) the boundary faces collapsed anyway -- a minority of degenerating faces
+    dilutes into an average over 990 -- and with a strong mean (EA_W=5000) the *global*
+    restoring force overpowered the shape signal and pulled the tile back to the lune
+    (perimeter regressed 1.11 -> 1.04). The mean punishes legitimate whole-tile deformation
+    and degeneracy with the same coin.
+
+    This term separates them: every face drifting moderately (a genuine shape change) barely
+    moves the top-5% statistic, while a few faces collapsing dominate it. So the barrier can
+    be strong against degeneracy without taxing deformation.
+
+    ``topk`` is differentiable -- gradients flow to the currently-worst faces, which is
+    exactly where the pushback belongs.
+    """
+    drift = (spherical_face_areas(points, faces) / reference_areas - 1.0) ** 2
+    k = max(1, int(len(drift) * fraction))
+    return torch.topk(drift, k).values.mean()
