@@ -194,3 +194,44 @@ def test_sphere_escher_runs_the_kite_domain(tmp_path):
 
     e.apply_shape_freeze()
     assert e.optimizer.param_groups[0]["lr"] == 0.0
+
+
+def test_revert_clears_adam_state(tmp_path):
+    """The revert deadlock: Adam's exp_avg kept pointing into the fold, so every step
+    after the first revert proposed the same fold (394 consecutive reverts measured).
+    Reverting must also drop the shape parameter's optimizer state."""
+    from pathlib import Path
+
+    from omegaconf import OmegaConf
+
+    from escher.main_sphere import PATH, SphereEscher
+
+    a = OmegaConf.load(PATH / "configs/sphere.yaml")
+    a.PARAM_MODE = "boundary"
+    a.ORBIFOLD_CONES = [2, 3, 4]
+    a.KITE_N = 6
+    a.DEVICE = "cpu"
+    a.OUTPUT_DIR = str(tmp_path)
+
+    e = SphereEscher.__new__(SphereEscher)
+    e.args = a
+    e.device = torch.device("cpu")
+    e.output_dir = Path(tmp_path)
+    e._init_geometry()
+    e._init_parameters()
+
+    # one real optimizer step so Adam has state for P
+    e.solve_points().sum().backward()
+    e.optimizer.step()
+    assert len(e.optimizer.state.get(e.shape_param, {})) > 0
+
+    e.reset_shape_optimizer_state()
+    assert len(e.optimizer.state.get(e.shape_param, {})) == 0
+
+    # and the texture group's state must survive the reset
+    e.optimizer.zero_grad()
+    (e.texture.sum() * 0.001).backward()
+    e.optimizer.step()
+    assert len(e.optimizer.state.get(e.texture, {})) > 0
+    e.reset_shape_optimizer_state()
+    assert len(e.optimizer.state.get(e.texture, {})) > 0

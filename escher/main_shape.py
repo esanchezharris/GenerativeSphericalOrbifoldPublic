@@ -158,6 +158,9 @@ def shape_step(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, ar
     points, flips, reverted = escher.ensure_valid_shape()
     if reverted:
         escher._n_reverts += 1
+        # Rejection resets P but not Adam's momentum, which otherwise re-proposes the
+        # same folding step forever (measured: 394 consecutive reverts, state frozen).
+        escher.reset_shape_optimizer_state()
 
     alpha = soft_alpha(escher, points, ctx)
     mask = args.MASK_LOSS_WEIGHT * mask_pyramid_loss(

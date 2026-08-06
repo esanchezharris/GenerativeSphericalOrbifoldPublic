@@ -256,6 +256,16 @@ class SphereEscher:
             p.grad.zero_()
         self.optimizer.param_groups[0]["lr"] = 0.0
 
+    def reset_shape_optimizer_state(self) -> None:
+        """Clear Adam's memory for the shape parameter after a fold revert.
+
+        Rejection resets P but not the optimizer: exp_avg keeps pointing into the fold,
+        so Adam re-proposes the same folding step forever -- the octahedral shape run
+        measured 394 consecutive reverts with every metric frozen. Dropping the state
+        makes the optimizer relearn the wall from the hinge gradient instead.
+        """
+        self.optimizer.state.pop(self.shape_param, None)
+
     def solve_points(self) -> torch.Tensor:
         """Current-mode differentiable solve: parameters -> unit-sphere vertices."""
         if self.args.PARAM_MODE == "boundary":
@@ -458,6 +468,7 @@ class SphereEscher:
         _, flips, reverted = self.ensure_valid_shape()
         if reverted:
             self._n_reverts += 1
+            self.reset_shape_optimizer_state()
 
         # Alternate between the two framings. Isolated views give SDS a silhouette to shape
         # the tile outline with; tiled views make the texture read correctly in context.
