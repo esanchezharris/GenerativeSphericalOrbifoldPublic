@@ -45,7 +45,7 @@ def tile_adjacency(tiler, mesh) -> list[tuple[int, int]]:
     the pole is one vertex on every rotation copy -- give a single position and do not
     count. Robust for any k because it reads the group itself, not an assumed layout.
     """
-    boundary = np.concatenate([mesh.left, mesh.right, mesh.bottom])
+    boundary = np.concatenate(list(mesh.boundary_chains))
     pts = mesh.points[boundary]
 
     seen: dict[tuple, set[int]] = {}

@@ -71,6 +71,12 @@ class LuneMesh:
     def bottom_right(self) -> int:
         return int(self.bottom[-1])
 
+    @property
+    def boundary_chains(self) -> list[np.ndarray]:
+        """The tile boundary as ordered chains -- the mesh-type-agnostic accessor that
+        ``boundary_loop``, the palette adjacency, and the perimeter metric consume."""
+        return [self.left, self.bottom, self.right]
+
 
 def _spherical_to_cartesian(colatitude: np.ndarray, longitude: np.ndarray) -> np.ndarray:
     sin_t = np.sin(colatitude)

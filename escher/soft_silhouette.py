@@ -31,11 +31,11 @@ __all__ = ["boundary_loop", "project_to_pixels", "soft_polygon_mask"]
 def boundary_loop(mesh) -> np.ndarray:
     """Ordered vertex indices once around the tile boundary (not repeated at the end).
 
-    Stitches the three chains (left cut, bottom arc, right cut) by their shared
-    endpoint indices, reversing chains as needed, so it does not depend on each
-    chain's stored orientation.
+    Stitches the mesh's boundary chains by their shared endpoint indices, reversing
+    chains as needed, so it depends on neither the chain order nor each chain's stored
+    orientation. Works for any mesh exposing ``boundary_chains`` (lune or kite).
     """
-    chains = [list(mesh.left), list(mesh.bottom), list(mesh.right)]
+    chains = [list(c) for c in mesh.boundary_chains]
     loop = chains.pop(0)
     while chains:
         for i, chain in enumerate(chains):
