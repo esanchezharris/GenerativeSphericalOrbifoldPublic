@@ -154,6 +154,48 @@ def test_gradient_reaches_free_points_through_generated_mates(small):
     assert left_grad.abs().sum() > 0, "gradient failed to flow through the rotation"
 
 
+# ------------------------------------------------------------------ freeze machinery
+@pytest.mark.parametrize("mode", ["boundary", "weights"])
+def test_shape_freeze_works_in_both_modes(mode, tmp_path):
+    """Regression: the freeze block referenced ``self.W`` directly and crashed run B1 the
+    moment the freeze condition first fired in boundary mode. Exercise the freeze path on
+    the real class in BOTH modes, without the diffusion model."""
+    from pathlib import Path
+
+    from omegaconf import OmegaConf
+
+    from escher.main_sphere import PATH, SphereEscher
+
+    a = OmegaConf.load(PATH / "configs/sphere.yaml")
+    a.PARAM_MODE = mode
+    a.DEVICE = "cpu"
+    a.MESH_N_THETA = 6
+    a.MESH_N_PHI = 5
+    a.OUTPUT_DIR = str(tmp_path)
+
+    e = SphereEscher.__new__(SphereEscher)
+    e.args = a
+    e.device = torch.device("cpu")
+    e.output_dir = Path(tmp_path)
+    e._init_geometry()
+    e._init_parameters()
+
+    # give the shape parameter a gradient, then freeze
+    pts = e.solve_points()
+    pts.sum().backward()
+    assert e.shape_param.grad is not None
+    assert e.shape_param.grad.abs().sum() > 0
+
+    e.apply_shape_freeze()
+    assert e.shape_param.grad.abs().sum() == 0
+    assert e.optimizer.param_groups[0]["lr"] == 0.0
+
+    # a frozen optimizer step must not move the shape parameter
+    before = e.shape_param.detach().clone()
+    e.optimizer.step()
+    assert torch.equal(e.shape_param.detach(), before)
+
+
 # ---------------------------------------------------------------------- warm start
 def test_warm_start_reduces_iterations_and_matches_cold(small):
     orb, _ = small

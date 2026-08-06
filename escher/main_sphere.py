@@ -187,6 +187,27 @@ class SphereEscher:
         r = (1.0 - self.args.W_RANGE) / 2.0
         return torch.special.expit(self.W) * self.args.W_RANGE + r
 
+    @property
+    def shape_param(self) -> torch.nn.Parameter:
+        """The mode's shape parameter: boundary points or edge-weight logits.
+
+        Every mode-agnostic touch of the shape parameter must go through this. The freeze
+        block once referenced ``self.W`` directly and crashed run B1 at the exact moment
+        the freeze condition first fired in boundary mode -- at step ~900, mid-success.
+        """
+        return self.P if self.args.PARAM_MODE == "boundary" else self.W
+
+    def apply_shape_freeze(self) -> None:
+        """Stop the shape from moving, exactly.
+
+        Zeroing the gradient alone is not a freeze: Adam's momentum keeps moving the
+        parameter for many steps afterwards. Zero the group's learning rate as well.
+        """
+        p = self.shape_param
+        if p.grad is not None:
+            p.grad.zero_()
+        self.optimizer.param_groups[0]["lr"] = 0.0
+
     def solve_points(self) -> torch.Tensor:
         """Current-mode differentiable solve: parameters -> unit-sphere vertices."""
         if self.args.PARAM_MODE == "boundary":
@@ -405,11 +426,7 @@ class SphereEscher:
             total_loss += sil
 
         if frozen:
-            # Zeroing the gradient alone is not a freeze: Adam's momentum keeps moving W
-            # for many steps afterwards. Zero the group's learning rate as well.
-            if self.W.grad is not None:
-                self.W.grad.zero_()
-            self.optimizer.param_groups[0]["lr"] = 0.0
+            self.apply_shape_freeze()
 
         self.optimizer.step()
 
