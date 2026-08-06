@@ -55,6 +55,17 @@ from escher.rendering.render_sphere_nvdiffrast import build_tiled_sphere, render
 PATH = Path(__file__).parent.absolute()
 
 
+def annealed_max_step(args, iteration: int) -> float:
+    """Linear anneal of the SDS max-timestep fraction over ``[0, SDS_ANNEAL_END]``.
+
+    High timesteps make layout-scale edits; low ones refine detail. Annealing the
+    ceiling downward moves SDS from composing the figure to polishing it, instead of
+    letting late high-noise samples keep repainting a texture that is already right.
+    """
+    t = min(max(iteration / max(args.SDS_ANNEAL_END, 1), 0.0), 1.0)
+    return float(args.SDS_MAX_START + (args.SDS_MAX_END - args.SDS_MAX_START) * t)
+
+
 class SphereEscher:
     """Optimises a spherical Escher tiling against a text prompt."""
 
@@ -123,9 +134,14 @@ class SphereEscher:
             self.W = torch.nn.Parameter(torch.zeros(n_edges, dtype=torch.float64))
             shape_group = {"params": [self.W], "lr": a.LR_W}
         res = a.TEXTURE_RESOLUTION
-        self.texture = torch.nn.Parameter(
-            torch.full((res, res, 3), 0.5, device=self.device, dtype=torch.float32)
-        )
+        init_color = a.get("TEXTURE_INIT_COLOR", None)
+        if init_color is None:
+            init = torch.full((res, res, 3), 0.5, dtype=torch.float32)
+        else:
+            # A flat start (e.g. gingerbread tan) instead of neutral gray: SDS then spends
+            # its budget on figure detail rather than on first fighting its way out of gray.
+            init = torch.tensor(list(init_color), dtype=torch.float32).repeat(res, res, 1)
+        self.texture = torch.nn.Parameter(init.to(self.device))
         # group 0 is always the shape parameters; the freeze machinery zeroes its LR
         self.optimizer = torch.optim.Adam(
             [shape_group, {"params": [self.texture], "lr": a.LR_TEXTURE}]
@@ -286,6 +302,7 @@ class SphereEscher:
         mv: torch.Tensor | None = None,
         isolated: bool = False,
         texture: torch.Tensor | None = None,
+        tint: torch.Tensor | None = None,
     ):
         """Render the tiling, or a single tile alone against the background.
 
@@ -318,6 +335,7 @@ class SphereEscher:
             distance=self.args.CAMERA_DISTANCE,
             fovy_deg=self.args.CAMERA_FOV,
             mv=mv,
+            tile_color_matrices=tint,
         )
         return images, alpha, points
 
@@ -403,6 +421,10 @@ class SphereEscher:
         # iteration; nothing in this repo (or upstream main.py) ever did, so grad_clip_val
         # stayed None and CLIP_GRADIENTS_IN_SDS was silently a no-op in every run to date.
         self.guidance.update_step(0, iteration)
+        if a.get("SDS_ANNEAL_END", 0) > 0:
+            self.guidance.set_step_range(
+                self.guidance.cfg.min_step_percent, annealed_max_step(a, iteration)
+            )
 
         frozen = self.shape_frozen(iteration)
 
@@ -584,11 +606,21 @@ class SphereEscher:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
+        # The wide panels show the deliverable look, tints included when configured; the
+        # close-up must stay untinted -- it exists to show what SDS actually sees.
+        tint = None
+        if self.args.get("TILE_TINT", False):
+            from escher.rendering.palette import tile_color_matrices
+
+            tint = tile_color_matrices(
+                self.tiler, self.mesh, list(self.args.PALETTE_HUES_DEG)
+            )
+
         with torch.no_grad():
             # whole-sphere overview, plus one training-style close-up so both the tiling and
             # the figure the model actually sees are visible in the same snapshot
             wide = orbit_views(3, distance=self.args.PREVIEW_DISTANCE, elevation_deg=18.0)
-            images, alpha, points = self.render(3, mv=wide)
+            images, alpha, points = self.render(3, mv=wide, tint=tint)
             comp = (images * alpha + 1.0 * (1 - alpha)).clamp(0, 1).cpu().numpy()
 
             centers = self.tiler.tile_centers(points.detach().cpu().numpy())
@@ -670,7 +702,12 @@ def main() -> None:
     cli = OmegaConf.from_cli()
     conf_file = cli.pop("CONF_FILE", "configs/sphere.yaml")
     resume = cli.pop("RESUME", None)
-    args = OmegaConf.merge(OmegaConf.load(PATH / conf_file), cli)
+    # CONF_FILE is an OVERLAY on the base config (sphere_texture.yaml holds only its
+    # phase's deltas), so the base always loads first.
+    layers = [OmegaConf.load(PATH / "configs/sphere.yaml")]
+    if conf_file != "configs/sphere.yaml":
+        layers.append(OmegaConf.load(PATH / conf_file))
+    args = OmegaConf.merge(*layers, cli)
     SphereEscher(args).run(resume_from=resume)
 
 

@@ -50,3 +50,17 @@ def test_set_step_range_moves_the_sampling_window():
     assert (g.min_step, g.max_step) == (20, 980)
     g.set_step_range(0.02, 0.5)
     assert (g.min_step, g.max_step) == (20, 500)
+
+
+def test_annealed_max_step_endpoints_and_clamp():
+    from omegaconf import OmegaConf
+
+    from escher.main_sphere import annealed_max_step
+
+    args = OmegaConf.create(
+        {"SDS_ANNEAL_END": 800, "SDS_MAX_START": 0.98, "SDS_MAX_END": 0.5}
+    )
+    assert annealed_max_step(args, 0) == pytest.approx(0.98)
+    assert annealed_max_step(args, 400) == pytest.approx(0.74)
+    assert annealed_max_step(args, 800) == pytest.approx(0.5)
+    assert annealed_max_step(args, 5000) == pytest.approx(0.5), "clamped past the end"

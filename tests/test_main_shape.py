@@ -113,3 +113,16 @@ def test_scaled_n_phi():
     for k in range(2, 13):
         n = scaled_n_phi(19, k)
         assert n % 2 == 1 and n >= 5
+
+
+def test_texture_init_color(tmp_path):
+    args = tiny_args(tmp_path)
+    assert args.TEXTURE_INIT_COLOR is None
+    escher = build_shape_run(args)
+    assert torch.allclose(escher.texture.detach(), torch.full_like(escher.texture, 0.5))
+
+    args.TEXTURE_INIT_COLOR = [0.76, 0.60, 0.42]
+    escher = build_shape_run(args)
+    tan = torch.tensor([0.76, 0.60, 0.42])
+    assert torch.allclose(escher.texture.detach()[0, 0], tan)
+    assert torch.allclose(escher.texture.detach()[-1, -1], tan)

@@ -134,6 +134,24 @@ FREEZE_SHAPE_AFTER: 1200
 FREEZE_ON_PERIM: 0.0
 FREEZE_ON_SPREAD: 0.0
 
+### texture init + SDS schedule
+# null keeps the historical 0.5 gray init; an [r, g, b] list starts from that flat color
+# so SDS spends its budget on figure detail instead of climbing out of gray.
+TEXTURE_INIT_COLOR: null
+# 0 disables. > 0 linearly anneals the SDS max-timestep fraction from SDS_MAX_START to
+# SDS_MAX_END by that step: early high-noise samples compose, late low-noise ones polish.
+SDS_ANNEAL_END: 0
+SDS_MAX_START: 0.98
+SDS_MAX_END: 0.5
+
+### presentation
+# Per-tile hue rotation (escher/rendering/palette.py): neighbors get different palette
+# hues, the alternating-color Escher look. RENDER-TIME ONLY -- snapshots' wide panels and
+# render_final; training always sees identity (tinted training views would push
+# conflicting hues into the one shared texture).
+TILE_TINT: false
+PALETTE_HUES_DEG: [0.0, 120.0, -120.0]
+
 ### output
 OUTPUT_DIR: "output/sphere"
 VISUALIZATION_FREQ: 50

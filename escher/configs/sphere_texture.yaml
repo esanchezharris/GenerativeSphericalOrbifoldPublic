@@ -1,0 +1,28 @@
+# Texture phase (main_sphere.py) -- merged ON TOP of sphere.yaml, resumed from a shape-
+# phase checkpoint:
+#
+#   python escher/main_sphere.py CONF_FILE=configs/sphere_texture.yaml \
+#       RESUME=output/sphere_shape_k4/checkpoint.pt OUTPUT_DIR=output/sphere_tex
+#
+# The outline is already the figure (deterministic shape phase), so this run is
+# texture-only: shape frozen from step 0, silhouette pass off.
+
+PROMPT: "a cute gingerbread man with white icing and candy buttons, flat vector illustration, solid pastel colors, simple shapes, a masterpiece"
+NEGATIVE_PROMPT: "noisy, grainy, photorealistic, 3d render, blurry, cluttered background"
+
+# Frozen from the first step; shape_frozen() latches immediately and its guard also
+# disables the silhouette pass. SILHOUETTE_WEIGHT 0 anyway for explicitness.
+FREEZE_SHAPE_AFTER: 0
+SILHOUETTE_WEIGHT: 0.0
+
+# Flat gingerbread tan, not gray/noise: the figure's base coat is already on.
+TEXTURE_INIT_COLOR: [0.76, 0.60, 0.42]
+
+# Compose early, polish late (see sphere.yaml).
+SDS_ANNEAL_END: 800
+N_STEPS: 1000
+
+# Wide snapshot panels show the deliverable's alternating-hue look.
+TILE_TINT: true
+
+OUTPUT_DIR: "output/sphere_tex"
