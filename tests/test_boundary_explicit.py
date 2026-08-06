@@ -196,6 +196,52 @@ def test_shape_freeze_works_in_both_modes(mode, tmp_path):
     assert torch.equal(e.shape_param.detach(), before)
 
 
+# ------------------------------------------------------------------ validity projection
+def test_folding_step_is_reverted(tmp_path):
+    """Run B1's failure: SDS pushed the boundary into a fold (19 flips by step 500) and
+    nothing stopped it. ensure_valid_shape must undo a folding move and land back on the
+    last valid parameters."""
+    from pathlib import Path
+
+    from omegaconf import OmegaConf
+
+    from escher.main_sphere import PATH, SphereEscher
+
+    a = OmegaConf.load(PATH / "configs/sphere.yaml")
+    a.PARAM_MODE = "boundary"
+    a.DEVICE = "cpu"
+    a.MESH_N_THETA = 8
+    a.MESH_N_PHI = 7
+    a.OUTPUT_DIR = str(tmp_path)
+
+    e = SphereEscher.__new__(SphereEscher)
+    e.args = a
+    e.device = torch.device("cpu")
+    e.output_dir = Path(tmp_path)
+    e._init_geometry()
+    e._init_parameters()
+
+    # healthy baseline: records P_good
+    _, flips, reverted = e.ensure_valid_shape()
+    assert flips == 0 and not reverted
+    good = e.P.detach().clone()
+
+    # a violent wiggle that folds the interior
+    rng = np.random.default_rng(0)
+    with torch.no_grad():
+        e.P.add_(torch.as_tensor(0.6 * rng.standard_normal(e.P.shape)))
+    pts_folded = e.solve_points()
+    assert count_flipped_faces(pts_folded.detach().numpy(), e.mesh.faces) > 0, (
+        "test premise: the wiggle must actually fold"
+    )
+
+    points, flips, reverted = e.ensure_valid_shape()
+    assert reverted
+    assert flips == 0
+    assert torch.allclose(e.P.detach(), good)
+    assert count_flipped_faces(points.detach().numpy(), e.mesh.faces) == 0
+
+
 # ---------------------------------------------------------------------- warm start
 def test_warm_start_reduces_iterations_and_matches_cold(small):
     orb, _ = small

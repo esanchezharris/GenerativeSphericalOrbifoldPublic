@@ -112,6 +112,8 @@ class SphereEscher:
         if a.PARAM_MODE == "boundary":
             # ~35 points on the free half of the cut, raw (normalised in boundary_b)
             self.P = torch.nn.Parameter(self.b_orb.initial_free_points().clone())
+            self._P_good: torch.Tensor | None = self.P.detach().clone()
+            self._n_reverts = 0
             shape_group = {"params": [self.P], "lr": a.LR_BOUNDARY}
         else:
             n_edges = len(self.mesh.edges)
@@ -213,6 +215,38 @@ class SphereEscher:
         if self.args.PARAM_MODE == "boundary":
             return self.embedder(self.b_orb.boundary_b(self.P))
         return self.embedder(self.edge_weights())
+
+    def ensure_valid_shape(self) -> tuple[torch.Tensor, int, bool]:
+        r"""Solve; if the boundary folded the interior, revert to the last valid ``P``.
+
+        Fixed-boundary spherical Tutte has **no bijectivity guarantee** for non-convex
+        boundaries, and run B1 showed the theory biting in practice: 19 folded faces by
+        step 500, 77 by the freeze -- invisible in renders, fatal to the certificate, and
+        flagged only in a log line nothing watched. Freezing on first contact would either
+        lock folds in or fire before any real deformation, so instead each step is
+        *projected onto the valid set by rejection*: a step that folds is undone and the
+        optimizer keeps sliding along fold-free directions.
+
+        Returns ``(points, flips, reverted)``; ``flips`` counts folds in the returned
+        state (0 unless even the revert target folds, which means the run is unhealthy).
+        """
+        points = self.solve_points()
+        if self.args.PARAM_MODE != "boundary":
+            return points, count_flipped_faces(
+                points.detach().cpu().numpy(), self.mesh.faces
+            ), False
+
+        flips = count_flipped_faces(points.detach().cpu().numpy(), self.mesh.faces)
+        reverted = False
+        if flips > 0 and self._P_good is not None:
+            with torch.no_grad():
+                self.P.copy_(self._P_good)
+            points = self.solve_points()
+            flips = count_flipped_faces(points.detach().cpu().numpy(), self.mesh.faces)
+            reverted = True
+        if flips == 0:
+            self._P_good = self.P.detach().clone()
+        return points, flips, reverted
 
     def boundary_chain_regularizers(self) -> torch.Tensor:
         r"""Spacing + smoothness penalties on the free boundary chains, in plain torch.
@@ -365,6 +399,11 @@ class SphereEscher:
 
         frozen = self.shape_frozen(iteration)
 
+        # Validity projection BEFORE anything uses this step's geometry.
+        _, flips, reverted = self.ensure_valid_shape()
+        if reverted:
+            self._n_reverts += 1
+
         # Alternate between the two framings. Isolated views give SDS a silhouette to shape
         # the tile outline with; tiled views make the texture read correctly in context.
         # The fraction sets the actual cadence (0.5 -> every 2nd step), not just on/off.
@@ -440,6 +479,8 @@ class SphereEscher:
         return {
             "loss": total_loss,
             "silhouette": sil,
+            "flips": flips,
+            "reverts": getattr(self, "_n_reverts", 0),
             "area_reg": float(reg.detach()) if torch.is_tensor(reg) else 0.0,
             "boundary_ratio": self._last_info["boundary_ratio"],
             "area_spread": area_spread,
@@ -476,13 +517,13 @@ class SphereEscher:
             if new:
                 f.write(
                     "step,loss,silhouette,area_reg,karcher,"
-                    "boundary_ratio,area_spread,solver_iters\n"
+                    "boundary_ratio,area_spread,flips,reverts,solver_iters\n"
                 )
             f.write(
                 f"{iteration},{info['loss']:.4f},{info['silhouette']:.4f},"
                 f"{info['area_reg']:.4f},{info['energy']:.6f},"
                 f"{info['boundary_ratio']:.6f},{info['area_spread']:.2f},"
-                f"{info['solver_iters']}\n"
+                f"{info['flips']},{info['reverts']},{info['solver_iters']}\n"
             )
 
     def check_geometry(self, points: torch.Tensor) -> tuple[bool, str]:
@@ -597,6 +638,7 @@ class SphereEscher:
                     f"karcher {info['energy']:7.4f} | "
                     f"perim {info['boundary_ratio']:6.4f}x | "
                     f"spread {info['area_spread']:6.1f} | "
+                    f"flp {info['flips']:2d}/{info['reverts']:3d} | "
                     f"solver {info['solver_iters']:3d} it | "
                     f"{per_step:5.2f} s/step | {mem:4.1f} GiB",
                     flush=True,
