@@ -79,7 +79,9 @@ def export_mesh(escher: SphereEscher, out_dir: Path) -> None:
     print(f"wrote {out_dir/'tiling.obj'} ({len(verts)} verts, {len(faces)} faces)")
 
 
-def render_turntable(escher: SphereEscher, out_dir: Path, n_frames: int = 120) -> None:
+def render_turntable(
+    escher: SphereEscher, out_dir: Path, n_frames: int = 120, tint: torch.Tensor | None = None
+) -> None:
     with torch.no_grad():
         points = escher.solve_points()
         sphere = build_tiled_sphere(
@@ -92,7 +94,11 @@ def render_turntable(escher: SphereEscher, out_dir: Path, n_frames: int = 120) -
         for i in range(0, n_frames, 4):  # render in small batches to bound VRAM
             mv = views[i : i + 4]
             images, alpha = render_tiled_sphere(
-                sphere, escher.texture, mv=mv, image_size=escher.args.RENDER_SIZE
+                sphere,
+                escher.texture,
+                mv=mv,
+                image_size=escher.args.RENDER_SIZE,
+                tile_color_matrices=tint,
             )
             comp = (images * alpha + 1.0 * (1 - alpha)).clamp(0, 1).cpu().numpy()
             frames.extend((f * 255).astype(np.uint8) for f in comp)
@@ -117,14 +123,25 @@ def render_turntable(escher: SphereEscher, out_dir: Path, n_frames: int = 120) -
 
 def main() -> None:
     if len(sys.argv) < 2:
-        raise SystemExit(f"usage: {sys.argv[0]} <checkpoint.pt>")
+        raise SystemExit(f"usage: {sys.argv[0]} <checkpoint.pt> [TINT=1]")
     checkpoint = Path(sys.argv[1])
     escher, iteration = load_run(checkpoint)
     print(f"loaded step {iteration} from {checkpoint}")
 
+    # Per-tile hue rotation (the alternating-color Escher look) is a render-time choice:
+    # TINT=1 on the command line, or TILE_TINT: true baked into the run's config. The OBJ
+    # export stays untinted either way -- one shared texture is the point of the mesh.
+    tint = None
+    if "TINT=1" in sys.argv[2:] or escher.args.get("TILE_TINT", False):
+        from escher.rendering.palette import tile_color_matrices
+
+        hues = list(escher.args.get("PALETTE_HUES_DEG", [0.0, 120.0, -120.0]))
+        tint = tile_color_matrices(escher.tiler, escher.mesh, hues)
+        print(f"tinting {escher.tiler.order} tiles with hue palette {hues}")
+
     out_dir = checkpoint.parent
     export_mesh(escher, out_dir)
-    render_turntable(escher, out_dir)
+    render_turntable(escher, out_dir, tint=tint)
 
 
 if __name__ == "__main__":

@@ -86,12 +86,15 @@ def render_tiled_sphere(
     mv: Tensor | None = None,
     glctx=None,
     generator: torch.Generator | None = None,
+    tile_color_matrices: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Render ``n_views`` images of the tiled sphere.
 
     Args:
         texture: ``(H, W, 3)`` or ``(1, H, W, 3)`` texture map, shared by every tile.
         mv: explicit ``(B, 4, 4)`` view matrices; if omitted, a fresh spread of random views.
+        tile_color_matrices: optional ``(G, 3, 3)`` per-tile color transform
+            (:mod:`escher.rendering.palette`); ``None`` renders exactly as before.
 
     Returns:
         ``(images, alpha)`` with images ``(B, H, W, 3)`` and alpha ``(B, H, W, 1)``.
@@ -112,6 +115,17 @@ def render_tiled_sphere(
     verts = sphere.vertices.unsqueeze(0).expand(batch, -1, -1).contiguous()
     uv = sphere.uv.unsqueeze(0).expand(batch, -1, -1).contiguous()
 
+    vertex_color_mtx = None
+    if tile_color_matrices is not None:
+        # Vertices are tile-major blocks of n (build_tiled_sphere), so repeating each
+        # tile's flattened matrix n times lines the attribute up with its vertices.
+        G = tile_color_matrices.shape[0]
+        n = sphere.vertices.shape[0] // G
+        vcm = tile_color_matrices.reshape(G, 9).to(device=device, dtype=torch.float32)
+        vertex_color_mtx = (
+            vcm.repeat_interleave(n, dim=0).unsqueeze(0).expand(batch, -1, -1).contiguous()
+        )
+
     rgba, _ = renderer.render_mesh_nvdiffrast(
         vertices=verts,
         faces=sphere.faces,
@@ -121,5 +135,6 @@ def render_tiled_sphere(
         image_size=(image_size, image_size),
         texture=texture,
         glctx=glctx,
+        vertex_color_mtx=vertex_color_mtx,
     )
     return rgba[..., :3], rgba[..., 3:4]

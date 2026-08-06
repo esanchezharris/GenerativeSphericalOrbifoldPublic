@@ -36,6 +36,7 @@ def render_mesh_nvdiffrast(
     image_size: Tuple[int, int] = (512, 512),
     texture: torch.Tensor = None,  # B,H,W,3
     glctx: dr.RasterizeCudaContext = None,
+    vertex_color_mtx: torch.Tensor = None,  # V,9 or B,V,9 -- per-vertex 3x3 color matrix
 ) -> torch.Tensor:  # B,H,W,4
     # Number of vertices
     vertices = vertices.to("cuda:0").float()
@@ -117,6 +118,15 @@ def render_mesh_nvdiffrast(
     else:
         texc, texd = dr.interpolate(uv.float(), rast_out, faces, rast_db=rast_out_db, diff_attrs="all")
         col = dr.texture(texture, texc, texd, filter_mode="linear-mipmap-linear", max_mip_level=9)
+    if vertex_color_mtx is not None:
+        # Per-vertex 3x3 color matrix, applied to the sampled color BEFORE antialiasing
+        # so tile borders blend already-transformed colors. When vertices are duplicated
+        # per tile (faces never index across tiles) the interpolation is exact per tile.
+        vcm = vertex_color_mtx.to("cuda:0").float()
+        if vcm.ndim == 2:
+            vcm = vcm.unsqueeze(0)
+        mtx, _ = dr.interpolate(vcm.contiguous(), rast_out, faces)  # C,H,W,9
+        col = torch.einsum("bhwij,bhwj->bhwi", mtx.reshape(*mtx.shape[:3], 3, 3), col)
     alpha = torch.clamp(rast_out[..., -1:], max=1)  # C,H,W,1
     depth = rast_out[:, :, :, 2]  # C,H,W,1
     # if debugging with depth
