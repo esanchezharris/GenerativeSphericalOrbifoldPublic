@@ -87,6 +87,7 @@ from .karcher import karcher_edge_hessians, weight_jacobian_vjp
 from .solver import SphericalEmbeddingResult, laplacian_from_edges, solve_spherical_embedding
 
 __all__ = [
+    "BoundaryEmbedder",
     "SphericalEmbedder",
     "assemble_hessian",
     "embed_differentiable",
@@ -298,3 +299,149 @@ def embed_differentiable(
 ) -> Tensor:
     """One-shot convenience wrapper around :class:`SphericalEmbedder`."""
     return SphericalEmbedder(edges, A, b, x0, warm_start=False)(weights)
+
+
+class _BoundaryEmbedFunction(torch.autograd.Function):
+    r"""Forward: fixed-boundary solve. Backward: :math:`\partial L/\partial b` via the
+    adjoint's constraint multipliers.
+
+    Differentiating the optimality system (:math:`\nabla E + A^\top\lambda = 0`,
+    :math:`Ax = b`) in :math:`b` and contracting with the upstream gradient :math:`v`
+    through the same regularized KKT adjoint used for the weight path gives
+
+    .. math:: \frac{\partial L}{\partial b} = \mu + O(\varepsilon),
+
+    where :math:`\mu` is the :math:`A`-block of the adjoint solution -- the multipliers we
+    were already computing and discarding. Validated against finite differences in
+    ``tests/test_boundary_explicit.py``.
+    """
+
+    @staticmethod
+    def forward(ctx, b: Tensor, embedder: "BoundaryEmbedder"):
+        result = embedder._run_solve(b.detach().cpu().double().numpy())
+        points = torch.as_tensor(result.points, dtype=b.dtype, device=b.device)
+        ctx.embedder = embedder
+        ctx.save_for_backward(points)
+        return points
+
+    @staticmethod
+    def backward(ctx, grad_points: Tensor):
+        (points,) = ctx.saved_tensors
+        embedder: BoundaryEmbedder = ctx.embedder
+        pts64 = points.detach().double().cpu()
+
+        H = assemble_hessian(pts64, embedder.edges_t, embedder.weights_t)
+        A = embedder.A
+        C = sphere_gauge_matrix(pts64.numpy())
+        m, g = A.shape[0], C.shape[0]
+        n_vars = 3 * pts64.shape[0]
+
+        eps = _MULTIPLIER_REGULARISATION * max(abs(H).max(), 1.0)
+        zero = lambda r, c: sp.csr_matrix((r, c))  # noqa: E731
+        kkt = sp.bmat(
+            [
+                [H, A.T, C.T],
+                [A, -eps * sp.eye(m), zero(m, g)],
+                [C, zero(g, m), -eps * sp.eye(g)],
+            ],
+            format="csc",
+        )
+        rhs = np.zeros(n_vars + m + g)
+        rhs[:n_vars] = grad_points.detach().double().cpu().numpy().reshape(-1)
+        sol = spla.splu(kkt).solve(rhs)
+
+        residual = np.linalg.norm(kkt @ sol - rhs) / max(np.linalg.norm(rhs), 1e-300)
+        if not np.isfinite(residual) or residual > _ADJOINT_RESIDUAL_TOL:
+            raise RuntimeError(
+                f"boundary adjoint solve did not converge (relative residual {residual:.3e})"
+            )
+
+        mu = sol[n_vars : n_vars + m]
+        grad_b = torch.as_tensor(mu, dtype=torch.float64)
+        return grad_b.to(dtype=grad_points.dtype, device=grad_points.device), None
+
+
+class BoundaryEmbedder:
+    """Differentiable fixed-boundary spherical embedding: ``b`` in, vertices out.
+
+    The counterpart of :class:`SphericalEmbedder` for the boundary-explicit
+    parameterization -- edge weights are held **uniform** and the boundary right-hand side
+    is the optimisation variable. Pair with
+    :class:`~escher.OTE.tilings_sphere.boundary_explicit.BoundaryExplicitDihedral`, whose
+    ``boundary_b`` builds ``b`` from the free half of the cut differentiably (so gradients
+    continue from ``b`` through the group maps onto the free points via autograd).
+
+    Warm starting exploits ``A`` being pure pins: any cached solution is made exactly
+    feasible for a *new* ``b`` by overwriting its pinned rows -- projection is assignment.
+    """
+
+    def __init__(
+        self,
+        edges: np.ndarray,
+        A: sp.spmatrix,
+        pin_order: np.ndarray,
+        x0_points: np.ndarray,
+        *,
+        warm_start: bool = True,
+        tol_x: float = 1e-11,
+        max_iter: int = 10_000,
+    ):
+        self.edges = np.asarray(edges)
+        self.edges_t = torch.as_tensor(self.edges, dtype=torch.long)
+        self.A = sp.csr_matrix(A)
+        self.pin_order = np.asarray(pin_order)
+        self.n_verts = np.asarray(x0_points).reshape(-1, 3).shape[0]
+        self._x0_points = np.asarray(x0_points, dtype=np.float64).reshape(-1, 3)
+        self.warm_start = warm_start
+        self.tol_x = tol_x
+        self.max_iter = max_iter
+
+        self.weights = np.ones(len(self.edges))
+        self.weights_t = torch.ones(len(self.edges), dtype=torch.float64)
+        self._laplacian = laplacian_from_edges(self.edges, self.weights, self.n_verts)
+
+        self._last_x: np.ndarray | None = None
+        self.last_result: SphericalEmbeddingResult | None = None
+        self.n_solves = 0
+        self.total_iterations = 0
+
+    @property
+    def last_stationarity(self) -> float | None:
+        if self.last_result is None:
+            return None
+        return self.last_result.stage2.proj_grad_inf_history[-1]
+
+    def _feasible_start(self, b: np.ndarray) -> np.ndarray:
+        base = (
+            self._last_x.reshape(-1, 3).copy()
+            if (self.warm_start and self._last_x is not None)
+            else self._x0_points.copy()
+        )
+        base[self.pin_order] = b.reshape(-1, 3)
+        return base.reshape(-1)
+
+    def _run_solve(self, b: np.ndarray) -> SphericalEmbeddingResult:
+        result = solve_spherical_embedding(
+            edges=self.edges,
+            weights=self.weights,
+            laplacian=self._laplacian,
+            A=self.A,
+            b=b,
+            x0=self._feasible_start(b),
+            tol_x=self.tol_x,
+            max_iter=self.max_iter,
+        )
+        self._last_x = result.stage2.x.copy()
+        self.last_result = result
+        self.n_solves += 1
+        self.total_iterations += result.stage1.n_iter + result.stage2.n_iter
+        return result
+
+    def __call__(self, b: Tensor) -> Tensor:
+        """``(3 * n_boundary,)`` pin RHS -> ``(n, 3)`` unit-sphere vertices."""
+        if b.ndim != 1 or b.shape[0] != self.A.shape[0]:
+            raise ValueError(f"expected b of length {self.A.shape[0]}, got {tuple(b.shape)}")
+        return _BoundaryEmbedFunction.apply(b, self)
+
+    def reset_warm_start(self) -> None:
+        self._last_x = None

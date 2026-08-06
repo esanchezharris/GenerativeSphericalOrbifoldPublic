@@ -34,7 +34,8 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from escher.OTE.core.spherical.differentiable import SphericalEmbedder
+from escher.OTE.core.spherical.differentiable import BoundaryEmbedder, SphericalEmbedder
+from escher.OTE.tilings_sphere.boundary_explicit import BoundaryExplicitDihedral
 from escher.OTE.core.spherical.regularizers import (
     area_tail_loss,
     equal_area_loss,
@@ -72,38 +73,58 @@ class SphereEscher:
     # ------------------------------------------------------------------------- setup
     def _init_geometry(self):
         a = self.args
-        self.orbifold = DihedralOrbifold.from_resolution(
-            k=a.ORBIFOLD_K, n_theta=a.MESH_N_THETA, n_phi=a.MESH_N_PHI
-        )
-        self.mesh = self.orbifold.mesh
-        self.tiler = self.orbifold.tiler()
-        self.embedder = SphericalEmbedder(
-            self.mesh.edges,
-            self.orbifold.A,
-            self.orbifold.b,
-            self.orbifold.initial_guess(),
-            warm_start=a.WARM_START,
-        )
+        if a.PARAM_MODE == "boundary":
+            # Free half of the cut as direct parameters; interior follows a fixed-boundary
+            # solve with uniform weights. See boundary_explicit.py for why.
+            self.b_orb = BoundaryExplicitDihedral.from_resolution(
+                k=a.ORBIFOLD_K, n_theta=a.MESH_N_THETA, n_phi=a.MESH_N_PHI
+            )
+            self.mesh = self.b_orb.mesh
+            self.tiler = self.b_orb.tiler()
+            self.embedder = BoundaryEmbedder(
+                self.mesh.edges,
+                self.b_orb.A,
+                self.b_orb.pin_order,
+                self.mesh.points,
+                warm_start=a.WARM_START,
+            )
+        else:
+            self.orbifold = DihedralOrbifold.from_resolution(
+                k=a.ORBIFOLD_K, n_theta=a.MESH_N_THETA, n_phi=a.MESH_N_PHI
+            )
+            self.mesh = self.orbifold.mesh
+            self.tiler = self.orbifold.tiler()
+            self.embedder = SphericalEmbedder(
+                self.mesh.edges,
+                self.orbifold.A,
+                self.orbifold.b,
+                self.orbifold.initial_guess(),
+                warm_start=a.WARM_START,
+            )
         print(
-            f"orbifold ({a.ORBIFOLD_K},2,2): {self.tiler.order} tiles | "
+            f"orbifold ({a.ORBIFOLD_K},2,2), mode={a.PARAM_MODE}: {self.tiler.order} tiles | "
             f"domain {self.mesh.n_verts} verts, {len(self.mesh.edges)} edges, "
             f"{len(self.mesh.faces)} faces"
         )
 
     def _init_parameters(self):
         a = self.args
-        n_edges = len(self.mesh.edges)
-        # Start from zero: sigmoid(0) = 0.5, i.e. uniform weights, i.e. the undeformed lune.
-        self.W = torch.nn.Parameter(torch.zeros(n_edges, dtype=torch.float64))
+        if a.PARAM_MODE == "boundary":
+            # ~35 points on the free half of the cut, raw (normalised in boundary_b)
+            self.P = torch.nn.Parameter(self.b_orb.initial_free_points().clone())
+            shape_group = {"params": [self.P], "lr": a.LR_BOUNDARY}
+        else:
+            n_edges = len(self.mesh.edges)
+            # Start from zero: sigmoid(0) = 0.5 -> uniform weights -> the undeformed lune.
+            self.W = torch.nn.Parameter(torch.zeros(n_edges, dtype=torch.float64))
+            shape_group = {"params": [self.W], "lr": a.LR_W}
         res = a.TEXTURE_RESOLUTION
         self.texture = torch.nn.Parameter(
             torch.full((res, res, 3), 0.5, device=self.device, dtype=torch.float32)
         )
+        # group 0 is always the shape parameters; the freeze machinery zeroes its LR
         self.optimizer = torch.optim.Adam(
-            [
-                {"params": [self.W], "lr": a.LR_W},
-                {"params": [self.texture], "lr": a.LR_TEXTURE},
-            ]
+            [shape_group, {"params": [self.texture], "lr": a.LR_TEXTURE}]
         )
 
         # Reference state for the equal-area regularizer: the undeformed lune's own
@@ -166,6 +187,42 @@ class SphereEscher:
         r = (1.0 - self.args.W_RANGE) / 2.0
         return torch.special.expit(self.W) * self.args.W_RANGE + r
 
+    def solve_points(self) -> torch.Tensor:
+        """Current-mode differentiable solve: parameters -> unit-sphere vertices."""
+        if self.args.PARAM_MODE == "boundary":
+            return self.embedder(self.b_orb.boundary_b(self.P))
+        return self.embedder(self.edge_weights())
+
+    def boundary_chain_regularizers(self) -> torch.Tensor:
+        r"""Spacing + smoothness penalties on the free boundary chains, in plain torch.
+
+        Direct and cheap (no solve involved): spacing keeps consecutive geodesic segment
+        lengths comparable so points cannot bunch into a pseudo-collapse, and the
+        second-difference term discourages jagged, self-intersection-prone curves. These
+        replace the area barriers of the weight mode -- here they act on the actual failure
+        surface (the curve) instead of fighting the solve.
+        """
+        p = self.P / self.P.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        nl = self.b_orb.n_free_left
+        pole = torch.tensor([0.0, 0.0, 1.0], dtype=p.dtype)
+        mid = torch.tensor([1.0, 0.0, 0.0], dtype=p.dtype)
+        corner = torch.as_tensor(
+            self.mesh.points[self.mesh.bottom_left], dtype=p.dtype
+        )
+        chains = [
+            torch.cat([pole[None], p[:nl], corner[None]]),      # left cut chain
+            torch.cat([corner[None], p[nl:], mid[None]]),       # left half of the arc
+        ]
+        spacing = p.new_zeros(())
+        smooth = p.new_zeros(())
+        for c in chains:
+            dots = (c[:-1] * c[1:]).sum(-1).clamp(-1.0, 1.0)
+            seg = torch.arccos(dots)
+            spacing = spacing + seg.var() / seg.mean().clamp_min(1e-9) ** 2
+            smooth = smooth + (c[2:] - 2 * c[1:-1] + c[:-2]).square().sum()
+        a = self.args
+        return a.BOUNDARY_SPACING_WEIGHT * spacing + a.BOUNDARY_SMOOTH_WEIGHT * smooth
+
     def render(
         self,
         n_views: int,
@@ -181,7 +238,7 @@ class SphereEscher:
         tiles, leaving no silhouette to push on, and only the texture can respond. The planar
         pipeline gets this for free by rendering one fundamental domain.
         """
-        points = self.embedder(self.edge_weights())
+        points = self.solve_points()
         group = self.solo_tiler if isolated else self.tiler
         sphere = build_tiled_sphere(
             points.to(self.device).float(), self.mesh.faces, self.mesh.uv, group
@@ -317,7 +374,9 @@ class SphereEscher:
                 reg = reg + a.AREA_TAIL_WEIGHT * area_tail_loss(
                     points, self.faces_t, self.ref_areas, fraction=a.AREA_TAIL_FRACTION
                 )
-            if a.W_REGULARIZATION > 0:
+            if a.PARAM_MODE == "boundary":
+                reg = reg + self.boundary_chain_regularizers()
+            elif a.W_REGULARIZATION > 0:
                 reg = reg + a.W_REGULARIZATION * (self.W**2).sum()
         if torch.is_tensor(reg):
             loss = loss + reg.to(loss)
@@ -426,11 +485,14 @@ class SphereEscher:
         """
         payload = {
             "iteration": iteration,
-            "W": self.W.detach().cpu(),
             "texture": self.texture.detach().cpu(),
             "optimizer": self.optimizer.state_dict(),
             "config": OmegaConf.to_container(self.args, resolve=True),
         }
+        if self.args.PARAM_MODE == "boundary":
+            payload["P"] = self.P.detach().cpu()
+        else:
+            payload["W"] = self.W.detach().cpu()
         tagged = self.output_dir / f"checkpoint_{iteration:06d}.pt"
         torch.save(payload, tagged)
         torch.save(payload, self.output_dir / "checkpoint.pt")
@@ -439,7 +501,10 @@ class SphereEscher:
     def load_checkpoint(self, path: str | Path) -> int:
         state = torch.load(path, map_location="cpu", weights_only=False)
         with torch.no_grad():
-            self.W.copy_(state["W"])
+            if "P" in state:
+                self.P.copy_(state["P"])
+            else:
+                self.W.copy_(state["W"])
             self.texture.copy_(state["texture"].to(self.device))
         self.optimizer.load_state_dict(state["optimizer"])
         return int(state["iteration"])
