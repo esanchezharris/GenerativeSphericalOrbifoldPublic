@@ -103,16 +103,14 @@ def draw_sphere_faces(
     xy = np.stack([points @ right, points @ up], axis=1)
 
     tri = points[faces]  # (n_faces, 3, 3)
-    normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
-    # On a sphere the outward normal agrees with the centroid direction up to winding.
     centroids = tri.mean(axis=1)
-    outward = np.where(
-        np.einsum("ij,ij->i", normals, centroids) < 0, -1.0, 1.0
-    )[:, None] * normals
-    visible = (outward @ view) > 0
 
-    idx = np.where(visible)[0]
-    idx = idx[np.argsort(centroids[idx] @ view)]  # painter's algorithm
+    # Painter's algorithm over *all* faces, back to front. Culling the far hemisphere first
+    # is tempting and faster, but triangles near the silhouette sit almost edge-on: they get
+    # culled while still projecting to visible area, leaving thin background-coloured slivers
+    # around the rim. Drawing everything in depth order costs 2x the polygons and has no
+    # such gaps.
+    idx = np.argsort(centroids @ view)
 
     if tile_index is None:
         colors = [_TILE_COLORS[0]] * len(idx)

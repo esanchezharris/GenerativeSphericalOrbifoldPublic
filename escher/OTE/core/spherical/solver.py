@@ -27,7 +27,34 @@ from .karcher import karcher_energy_and_grad
 from .lbfgs import LBFGSResult, ProjectedLBFGS
 from .precond import PrecondFixed, PrecondIdentity
 
-__all__ = ["SphericalEmbeddingResult", "make_karcher_objective", "solve_spherical_embedding"]
+__all__ = [
+    "SphericalEmbeddingResult",
+    "laplacian_from_edges",
+    "make_karcher_objective",
+    "solve_spherical_embedding",
+]
+
+
+def laplacian_from_edges(
+    edges: np.ndarray, weights: np.ndarray, n_vertices: int
+) -> sp.csr_matrix:
+    """Weighted Laplacian in the convention used throughout: ``+w`` off-diagonal,
+    ``-sum(w)`` on the diagonal, so the matrix is negative semi-definite.
+
+    Matches ``Solver.Wmat`` in the reference. No negative-weight clamping is applied --
+    unlike cotangent weights, the Tutte weights this pipeline optimises are positive by
+    construction.
+    """
+    edges = np.asarray(edges)
+    weights = np.asarray(weights, dtype=np.float64).ravel()
+    if len(edges) != len(weights):
+        raise ValueError(f"got {len(edges)} edges but {len(weights)} weights")
+
+    rows = np.concatenate([edges[:, 0], edges[:, 1]])
+    cols = np.concatenate([edges[:, 1], edges[:, 0]])
+    vals = np.concatenate([weights, weights])
+    L = sp.csr_matrix((vals, (rows, cols)), shape=(n_vertices, n_vertices))
+    return L - sp.diags(np.asarray(L.sum(axis=1)).ravel())
 
 
 @dataclass
