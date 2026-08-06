@@ -1,0 +1,31 @@
+# Planar texture phase (main.py) -- overlay on base.yaml, resumed from the
+# deterministic shape carve:
+#
+#   python escher/main.py CONF_FILE=configs/planar_texture.yaml
+#
+# GEM-faithful: the first 600 steps are JOINT shape+texture SDS -- the mask-carved
+# W_INIT is the head start, and SDS's texture-slide gradients add the articulation the
+# mask alone cannot afford under the validity regs -- then 400 texture-only steps
+# polish on the frozen shape.
+
+TILING_TYPE: "Torus"          # must match the shape run (W shape is checked on load)
+MESH_RESOLUTION: 50
+W_INIT_PATH: "output/planar_shape/checkpoint.pt"
+ONLY_TEXTURE_FROM_THIS_POINT: 600
+
+PROMPT: "a cute gingerbread man with white icing and candy buttons, flat vector illustration, solid pastel colors, simple shapes, a masterpiece"
+NEGATIVE_PROMPT: "noisy, grainy, photorealistic, 3d render, blurry, cluttered background, knitted, yarn, fabric, woven texture"
+
+# base.yaml's stabilityai repo is gated on the Hub (401); this is the ungated mirror
+# of the same weights the spherical pipeline uses.
+PRETRAINED_MODEL_NAME_OR_PATH: "Manojb/stable-diffusion-2-1-base"
+GUIDANCE_SCALE: 30.0
+CLIP_GRADIENTS_IN_SDS: true   # actually live now that arm_sds runs
+SDS_ANNEAL_END: 800
+TEXTURE_INIT_COLOR: [0.76, 0.60, 0.42]
+
+BW: false
+RANDOM_RIGID: false           # the figure is fixed; rigid jitter only confuses it
+N_STEPS: 1000
+SEED: 0
+OUTPUT_DIR: "output/planar_tex"
