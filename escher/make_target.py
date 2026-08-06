@@ -103,8 +103,11 @@ def generate(args) -> None:
     fig.savefig(out_dir / "contact_sheet.png", dpi=120, bbox_inches="tight")
     print(f"wrote {out_dir / 'contact_sheet.png'}")
 
-    # Auto-pick the largest figure; CHOOSE=i on a re-run overrides without the GPU.
-    valid = [(i, a) for i, _, m, a in candidates if m is not None]
+    # Auto-pick the largest PLAUSIBLE figure; CHOOSE=i on a re-run overrides without the
+    # GPU. Area near 1.0 is an inverted/dark-background generation (the whole frame
+    # became "figure"), not a big figure -- the first sheet's naive largest-area pick
+    # chose exactly that, so the band is load-bearing.
+    valid = [(i, a) for i, _, m, a in candidates if m is not None and 0.08 <= a <= 0.6]
     if not valid:
         raise SystemExit("no candidate binarized cleanly -- adjust PROMPT and rerun")
     best = max(valid, key=lambda t: t[1])[0]
