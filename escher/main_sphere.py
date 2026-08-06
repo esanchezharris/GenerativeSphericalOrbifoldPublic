@@ -245,6 +245,16 @@ class SphereEscher:
         # train_step returns (loss, sampled timestep); the timestep is diagnostic only.
         loss, timestep = self.guidance.train_step(composited, self.text_embeds)
 
+        # Back-propagate this pass BEFORE building the silhouette graph. Summing the two
+        # losses and calling backward once is equivalent mathematically but keeps both
+        # diffusion graphs alive at the same time, which took peak VRAM from 9.1 to 11.8 GiB
+        # of the 12 available -- close enough to the limit that the allocator thrashed and
+        # the step rate collapsed from 0.54 to over 2.3 s. Separate backwards accumulate
+        # into the same .grad buffers, so the result is identical and the first graph is
+        # freed before the second is built.
+        loss.backward()
+        total_loss = float(loss.detach())
+
         sil = 0.0
         use_silhouette = (
             a.SILHOUETTE_WEIGHT > 0
@@ -253,18 +263,17 @@ class SphereEscher:
             and iteration < a.FREEZE_SHAPE_AFTER
         )
         if use_silhouette:
-            sil_loss = self.silhouette_loss(a.SILHOUETTE_BATCH_SIZE)
-            loss = loss + a.SILHOUETTE_WEIGHT * sil_loss
+            sil_loss = a.SILHOUETTE_WEIGHT * self.silhouette_loss(a.SILHOUETTE_BATCH_SIZE)
+            sil_loss.backward()
             sil = float(sil_loss.detach())
-
-        loss.backward()
+            total_loss += sil
 
         if iteration >= a.FREEZE_SHAPE_AFTER and self.W.grad is not None:
             self.W.grad.zero_()
 
         self.optimizer.step()
         return {
-            "loss": float(loss.detach()),
+            "loss": total_loss,
             "silhouette": sil,
             "timestep": float(timestep.float().mean()),
             "energy": self.embedder.last_result.energy,
