@@ -368,6 +368,13 @@ class SphereEscher:
         silhouette. nvdiffrast's ``antialias`` supplies the vertex-position gradients along
         those boundary edges, and they reach the edge weights through the implicit solve.
         The texture receives nothing from this term.
+
+        MEASURED CAVEAT (probe, 2026-08-06): with a uniform texture this render's alpha
+        AND the full composite return vertex gradients of exactly zero -- the antialias
+        contribution never arrives. This pass therefore shaped nothing on its own; outline
+        movement in past runs came from the textured pass's texture-slide gradients plus
+        SDS noise. The deterministic shape phase (``main_shape.py``, analytic silhouette)
+        replaces it as the outline driver; this term is retained for reference.
         """
         images, alpha, _ = self.render(
             n_views, isolated=True, texture=self.solid_texture

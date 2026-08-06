@@ -1,16 +1,20 @@
 """Deterministic shape phase: fit the tile outline to a target silhouette mask.
 
-The SDS silhouette pass was the outline's only driver and its weakest link: noisy
-gradients, CUDA-chaotic trajectories, and a measured equilibrium of ~1.13x perimeter
-before the noise and the validity terms stalemate. This driver replaces it. A figure
-mask is generated once (``make_target.py``), aligned over the undeformed tile, and the
-free boundary points are optimized so the isolated tile's rendered alpha matches it --
-a fixed camera, a deterministic loss (``shape_target.mask_pyramid_loss``), exact
-gradients, and NO diffusion model in memory. Steps cost a solve plus one raster, so a
-whole run takes minutes and A/B experiments (targets, ``ORBIFOLD_K``) are cheap.
+The SDS silhouette pass was believed to drive the outline; a gradient probe showed it
+never did -- the rasterizer's alpha (and the whole RGB+alpha composite) return EXACTLY
+zero vertex gradients under a uniform texture, so every outline change in the SDS runs
+came from the textured pass's texture-slide gradients plus noise. This driver replaces
+that non-signal with a real one, twice over:
+
+1. The target is a figure mask generated ONCE by full denoising (``make_target.py``),
+   aligned over the undeformed tile -- deterministic, no SDS noise.
+2. The tile silhouette is computed analytically (``soft_silhouette``): project the
+   boundary loop with the renderer's own camera conventions, soft-fill the polygon.
+   Dense exact gradients, and NO renderer in the optimization loop at all -- the shape
+   phase runs on CPU; the GPU is only used by snapshots' pretty wide views.
 
 All validity machinery carries over unchanged: fold rejection (``ensure_valid_shape``),
-the margin hinge, chain spacing/smoothness, and the equal-area terms. Checkpoints are
+the margin hinge, chain spacing/smoothness, the equal-area terms. Checkpoints are
 ordinary ``SphereEscher`` checkpoints, so the texture phase resumes one with the
 existing ``RESUME=`` path.
 
@@ -23,6 +27,7 @@ Usage (inside the WSL venv)::
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -30,14 +35,26 @@ import torch
 from omegaconf import OmegaConf
 
 from escher.main_sphere import PATH, SphereEscher
-from escher.rendering.camera import orbit_views, tile_centric_views
+from escher.rendering.camera import orbit_views, perspective, tile_centric_views
 from escher.shape_target import align_mask_to, mask_pyramid_loss, soft_iou
+from escher.soft_silhouette import boundary_loop, project_to_pixels, soft_polygon_mask
 from escher.OTE.core.spherical.regularizers import (
     area_margin_loss,
     area_tail_loss,
     equal_area_loss,
 )
 from escher.geometry.spherical_sanity_checks import signed_solid_angles
+
+
+@dataclass
+class ShapeContext:
+    """Everything fixed for the whole run: camera, projection, boundary order."""
+
+    mv: torch.Tensor  # (1, 4, 4), computed once from the UNDEFORMED mesh
+    proj: torch.Tensor  # (4, 4)
+    loop: torch.Tensor  # ordered boundary vertex indices
+    size: int
+    tau: float
 
 
 def build_shape_run(args) -> SphereEscher:
@@ -63,10 +80,9 @@ def build_shape_run(args) -> SphereEscher:
 def fixed_tile_camera(escher: SphereEscher, args) -> torch.Tensor:
     """One ``(1, 4, 4)`` view of the fundamental domain, computed ONCE.
 
-    From the UNDEFORMED ``mesh.points``, with zero jitter. The default render path
-    re-derives tile centers from the *current deformed* points every step and consumes
-    global RNG -- under a fixed target mask that would slide the camera (and so the
-    target) under the tile as it deforms, corrupting the loss.
+    From the UNDEFORMED ``mesh.points``, with zero jitter. Re-deriving the camera from
+    the current deformed points every step (what the SDS render path does) would slide
+    the fixed target under the tile as it deforms, corrupting the loss.
     """
     centers = escher.solo_tiler.tile_centers(escher.mesh.points)
     return tile_centric_views(
@@ -75,6 +91,26 @@ def fixed_tile_camera(escher: SphereEscher, args) -> torch.Tensor:
         distance=float(args.SHAPE_CAMERA_DISTANCE),
         angular_jitter_deg=0.0,
     )
+
+
+def make_context(escher: SphereEscher, args) -> ShapeContext:
+    return ShapeContext(
+        mv=fixed_tile_camera(escher, args),
+        proj=perspective(fovy_deg=float(args.CAMERA_FOV)),
+        loop=torch.as_tensor(boundary_loop(escher.mesh), dtype=torch.long),
+        size=int(args.RENDER_SIZE),
+        tau=float(args.MASK_TAU),
+    )
+
+
+def soft_alpha(escher: SphereEscher, points: torch.Tensor, ctx: ShapeContext) -> torch.Tensor:
+    """``(1, H, W, 1)`` differentiable silhouette of the current tile."""
+    px = project_to_pixels(points[ctx.loop], ctx.mv, ctx.proj, ctx.size, ctx.size)
+    # float32 on the run device for the (pixels x segments) field; gradients flow back
+    # through the cast into the float64 solve.
+    px = px.to(device=escher.device, dtype=torch.float32)
+    mask = soft_polygon_mask(px, ctx.size, ctx.size, tau=ctx.tau)
+    return mask.reshape(1, ctx.size, ctx.size, 1)
 
 
 def load_target_mask(path: str | Path) -> np.ndarray:
@@ -89,12 +125,11 @@ def load_target_mask(path: str | Path) -> np.ndarray:
     return (img / max(img.max(), 1e-9) > 0.5).astype(np.float32)
 
 
-def prepare_target(escher: SphereEscher, mv: torch.Tensor, args) -> torch.Tensor:
+def prepare_target(escher: SphereEscher, ctx: ShapeContext, args) -> torch.Tensor:
     """Align the raw mask over the undeformed tile's silhouette; save the evidence."""
     raw = load_target_mask(args.TARGET_MASK)
     with torch.no_grad():
-        _, alpha, _ = escher.render(1, mv=mv, isolated=True, texture=escher.solid_texture)
-    alpha0 = alpha[0, ..., 0].detach().cpu().numpy()
+        alpha0 = soft_alpha(escher, escher.solve_points(), ctx)[0, ..., 0].cpu().numpy()
 
     aligned, params, iou = align_mask_to(alpha0, raw)
     print(
@@ -112,18 +147,19 @@ def prepare_target(escher: SphereEscher, mv: torch.Tensor, args) -> torch.Tensor
     return torch.as_tensor(aligned, device=escher.device)
 
 
-def shape_step(escher: SphereEscher, target: torch.Tensor, mv: torch.Tensor, args) -> dict:
-    """One optimization step: ``SphereEscher.step()``'s skeleton, minus everything SDS."""
+def shape_step(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, args) -> dict:
+    """One optimization step: ``SphereEscher.step()``'s skeleton, minus everything SDS.
+
+    One solve per step: ``ensure_valid_shape`` already solved, and the silhouette is
+    computed from those points analytically -- there is no render here to re-solve for.
+    """
     escher.optimizer.zero_grad()
 
-    # Validity projection first, exactly as the SDS loop does it.
-    _, flips, reverted = escher.ensure_valid_shape()
+    points, flips, reverted = escher.ensure_valid_shape()
     if reverted:
         escher._n_reverts += 1
 
-    # The second solve after a revert is warm-started and near-free.
-    _, alpha, points = escher.render(1, mv=mv, isolated=True, texture=escher.solid_texture)
-
+    alpha = soft_alpha(escher, points, ctx)
     mask = args.MASK_LOSS_WEIGHT * mask_pyramid_loss(
         alpha, target, levels=args.MASK_PYRAMID_LEVELS
     )
@@ -187,7 +223,7 @@ def log_shape_metrics(output_dir: Path, iteration: int, info: dict) -> None:
 
 
 def save_shape_snapshot(
-    escher: SphereEscher, target: torch.Tensor, mv: torch.Tensor, iteration: int
+    escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, iteration: int
 ) -> None:
     import matplotlib
 
@@ -195,23 +231,32 @@ def save_shape_snapshot(
     import matplotlib.pyplot as plt
 
     with torch.no_grad():
-        _, alpha, points = escher.render(
-            1, mv=mv, isolated=True, texture=escher.solid_texture
-        )
-        wide_mv = orbit_views(1, distance=escher.args.PREVIEW_DISTANCE, elevation_deg=18.0)
-        images, walpha, _ = escher.render(1, mv=wide_mv)
-        wide = (images * walpha + 1.0 * (1 - walpha)).clamp(0, 1).cpu().numpy()[0]
+        alpha = soft_alpha(escher, escher.solve_points(), ctx)
+
+        # The wide tiled view needs nvdiffrast (CUDA); on CPU the analytic panels stand
+        # alone, which is what lets the whole driver run in the CPU test suite.
+        wide = None
+        if escher.device.type == "cuda":
+            wide_mv = orbit_views(
+                1, distance=escher.args.PREVIEW_DISTANCE, elevation_deg=18.0
+            )
+            images, walpha, _ = escher.render(1, mv=wide_mv)
+            wide = (images * walpha + 1.0 * (1 - walpha)).clamp(0, 1).cpu().numpy()[0]
 
     achieved = alpha[0, ..., 0].cpu().numpy()
     tgt = target.cpu().numpy()
     overlay = np.stack([tgt, achieved, np.zeros_like(tgt)], axis=-1)
 
-    fig, axes = plt.subplots(1, 4, figsize=(15.5, 4.2))
-    for ax, img, title in zip(
-        axes,
-        [tgt, achieved, overlay, wide],
-        ["target", "achieved silhouette", "overlay (R=target, G=achieved)", "tiled sphere"],
-    ):
+    panels = [
+        (tgt, "target"),
+        (achieved, "achieved silhouette"),
+        (overlay, "overlay (R=target, G=achieved)"),
+    ]
+    if wide is not None:
+        panels.append((wide, "tiled sphere"))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.0 * len(panels), 4.2))
+    for ax, (img, title) in zip(np.atleast_1d(axes), panels):
         ax.imshow(img, cmap="gray" if img.ndim == 2 else None)
         ax.set_title(title, fontsize=10)
         ax.set_axis_off()
@@ -225,13 +270,13 @@ def save_shape_snapshot(
 
 def run_shape(args) -> dict:
     escher = build_shape_run(args)
-    mv = fixed_tile_camera(escher, args)
-    target = prepare_target(escher, mv, args)
+    ctx = make_context(escher, args)
+    target = prepare_target(escher, ctx, args)
 
     start = time.time()
     info: dict = {}
     for iteration in range(int(args.SHAPE_STEPS) + 1):
-        info = shape_step(escher, target, mv, args)
+        info = shape_step(escher, target, ctx, args)
 
         if iteration % 10 == 0:
             log_shape_metrics(escher.output_dir, iteration, info)
@@ -251,7 +296,7 @@ def run_shape(args) -> dict:
             ok, message = escher.check_geometry(info["points"])
             if not ok:
                 print(f"  !! geometry check failed: {message}")
-            save_shape_snapshot(escher, target, mv, iteration)
+            save_shape_snapshot(escher, target, ctx, iteration)
             escher.save_checkpoint(iteration)
 
     escher.save_checkpoint(int(args.SHAPE_STEPS))
