@@ -21,6 +21,12 @@ PLANAR_FRAME_HALF_WIDTH: 2.4
 SHAPE_STEPS: 400
 LR_SHAPE: 0.05
 W_REGULARIZATION: 0.02
+# Anti-tendril terms (measured: without them the boundary grows hairy spikes into the
+# target's soft band -- perimeter 8 -> 13.3 by step 100 with static IoU). The perimeter
+# hinge only charges for length BEYOND the undeformed tile's; drift keeps faces near
+# their initial areas, the planar twin of the sphere's equal-area barrier.
+PERIMETER_WEIGHT: 100.0
+EQUAL_AREA_WEIGHT_2D: 100.0
 SEED: 0
 
 DEVICE: "cpu"                # the solve is CPU; cuda only accelerates the mask field

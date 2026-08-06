@@ -45,6 +45,15 @@ class PlanarShapeContext:
     size: int
     tau: float
     device: torch.device
+    ref_areas: torch.Tensor  #: signed face areas of the W=0 solve, for the drift reg
+    perimeter0: float  #: boundary length of the W=0 solve, for the length reg
+
+
+def planar_face_areas(mapped: torch.Tensor, faces: torch.Tensor) -> torch.Tensor:
+    """Signed triangle areas via the 2D cross product, differentiably."""
+    a, b, c = mapped[faces[:, 0]], mapped[faces[:, 1]], mapped[faces[:, 2]]
+    ab, ac = b - a, c - a
+    return 0.5 * (ab[:, 0] * ac[:, 1] - ab[:, 1] * ac[:, 0])
 
 
 def build_planar_shape_run(args) -> Escher:
@@ -138,7 +147,19 @@ def shape_step(escher, optimizer, target, ctx: PlanarShapeContext, args) -> dict
     mask = args.MASK_LOSS_WEIGHT * mask_pyramid_loss(
         alpha, target, levels=args.MASK_PYRAMID_LEVELS
     )
+    # Measured failure without these: the boundary grows HAIRY TENDRILS -- thin spikes
+    # into the target's soft band that buy coarse-pyramid coverage with unpenalized
+    # length (perimeter 8 -> 13.3 by step 100, IoU static). The sphere runs were
+    # protected by their area barrier / chain regs; the plane needs its own:
+    boundary = mapped[ctx.loop]
+    perimeter = (boundary.roll(-1, 0) - boundary).norm(dim=-1).sum()
     reg = args.W_REGULARIZATION * (escher.W**2).sum()
+    reg = reg + args.PERIMETER_WEIGHT * torch.relu(perimeter - ctx.perimeter0)
+    if args.EQUAL_AREA_WEIGHT_2D > 0:
+        areas = planar_face_areas(mapped, escher.faces)
+        reg = reg + args.EQUAL_AREA_WEIGHT_2D * (
+            (areas / ctx.ref_areas - 1.0) ** 2
+        ).mean()
     loss = mask + reg.to(mask)
     loss.backward()
     optimizer.step()
@@ -239,13 +260,19 @@ def save_checkpoint(escher, iteration: int, args) -> Path:
 
 def run_shape(args) -> dict:
     escher = build_planar_shape_run(args)
-    ctx = PlanarShapeContext(
-        loop=torch.as_tensor(np.asarray(escher.bdry), dtype=torch.long),
-        half_width=float(args.PLANAR_FRAME_HALF_WIDTH),
-        size=int(args.RENDER_SIZE),
-        tau=float(args.MASK_TAU),
-        device=torch.device(args.DEVICE),
-    )
+    with torch.no_grad():
+        mapped0 = solve_tile(escher)
+        loop_t = torch.as_tensor(np.asarray(escher.bdry), dtype=torch.long)
+        b0 = mapped0[loop_t]
+        ctx = PlanarShapeContext(
+            loop=loop_t,
+            half_width=float(args.PLANAR_FRAME_HALF_WIDTH),
+            size=int(args.RENDER_SIZE),
+            tau=float(args.MASK_TAU),
+            device=torch.device(args.DEVICE),
+            ref_areas=planar_face_areas(mapped0, escher.faces).detach(),
+            perimeter0=float((b0.roll(-1, 0) - b0).norm(dim=-1).sum()),
+        )
     target = prepare_target(escher, ctx, args)
     optimizer = torch.optim.Adam([escher.W], lr=float(args.LR_SHAPE))
 
