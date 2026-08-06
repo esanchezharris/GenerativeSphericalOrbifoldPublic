@@ -37,7 +37,7 @@ from omegaconf import OmegaConf
 from escher.OTE.core.spherical.differentiable import SphericalEmbedder
 from escher.OTE.tilings_sphere import DihedralOrbifold
 from escher.geometry.spherical_sanity_checks import check_covers_sphere_once, count_flipped_faces
-from escher.rendering.camera import orbit_views
+from escher.rendering.camera import orbit_views, tile_centric_views
 from escher.rendering.render_sphere_nvdiffrast import build_tiled_sphere, render_tiled_sphere
 
 PATH = Path(__file__).parent.absolute()
@@ -122,11 +122,32 @@ class SphereEscher:
         r = (1.0 - self.args.W_RANGE) / 2.0
         return torch.special.expit(self.W) * self.args.W_RANGE + r
 
-    def render(self, n_views: int, mv: torch.Tensor | None = None):
+    def render(
+        self, n_views: int, mv: torch.Tensor | None = None, isolated: bool = False
+    ):
+        """Render the tiling, or a single tile alone against the background.
+
+        ``isolated=True`` renders just the fundamental domain, so the frame contains the
+        tile's **silhouette**. That is what lets score distillation shape the tile outline
+        into the prompt's figure -- with the full tiling every view is completely covered by
+        tiles, leaving no silhouette to push on, and only the texture can respond. The planar
+        pipeline gets this for free by rendering one fundamental domain.
+        """
         points = self.embedder(self.edge_weights())
+        group = self.solo_tiler if isolated else self.tiler
         sphere = build_tiled_sphere(
-            points.to(self.device).float(), self.mesh.faces, self.mesh.uv, self.tiler
+            points.to(self.device).float(), self.mesh.faces, self.mesh.uv, group
         )
+        if mv is None and self.args.TILE_CENTRIC_VIEWS:
+            centers = group.tile_centers(points.detach().cpu().numpy())
+            mv = tile_centric_views(
+                torch.as_tensor(centers, dtype=torch.float32),
+                n_views,
+                distance=(
+                    self.args.ISOLATED_DISTANCE if isolated else self.args.CAMERA_DISTANCE
+                ),
+                angular_jitter_deg=self.args.VIEW_JITTER_DEG,
+            )
         images, alpha = render_tiled_sphere(
             sphere,
             self.texture,
@@ -138,13 +159,25 @@ class SphereEscher:
         )
         return images, alpha, points
 
+    @property
+    def solo_tiler(self):
+        """A trivial one-element group: renders the fundamental domain by itself."""
+        from escher.geometry.sphere_tiler import SphericalTiler
+
+        if not hasattr(self, "_solo_tiler"):
+            self._solo_tiler = SphericalTiler(rotations=np.eye(3)[None], cone_orders=None)
+        return self._solo_tiler
+
     def step(self, iteration: int) -> dict:
         a = self.args
         self.optimizer.zero_grad()
         if a.CLAMP_TEXTURE:
             self.texture.data.clamp_(0.0, 1.0)
 
-        images, alpha, points = self.render(a.IMAGE_BATCH_SIZE)
+        # Alternate between the two framings. Isolated views give SDS a silhouette to shape
+        # the tile outline with; tiled views make the texture read correctly in context.
+        isolated = (iteration % 2 == 0) and a.ISOLATED_TILE_FRACTION > 0
+        images, alpha, points = self.render(a.IMAGE_BATCH_SIZE, isolated=isolated)
 
         if a.RANDOM_BACKGROUND:
             bg = torch.rand(images.shape[0], 1, 1, 3, device=self.device)
@@ -178,6 +211,33 @@ class SphereEscher:
         verts, faces, _ = self.tiler.tile_mesh(pts, self.mesh.faces)
         return check_covers_sphere_once(verts, faces)
 
+    def save_checkpoint(self, iteration: int) -> Path:
+        """Persist everything needed to re-render or resume.
+
+        The optimised state is small (edge weights plus one texture), so this is cheap and
+        worth doing often -- a run is ~25 minutes and snapshots alone cannot be reloaded.
+        """
+        path = self.output_dir / "checkpoint.pt"
+        torch.save(
+            {
+                "iteration": iteration,
+                "W": self.W.detach().cpu(),
+                "texture": self.texture.detach().cpu(),
+                "optimizer": self.optimizer.state_dict(),
+                "config": OmegaConf.to_container(self.args, resolve=True),
+            },
+            path,
+        )
+        return path
+
+    def load_checkpoint(self, path: str | Path) -> int:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        with torch.no_grad():
+            self.W.copy_(state["W"])
+            self.texture.copy_(state["texture"].to(self.device))
+        self.optimizer.load_state_dict(state["optimizer"])
+        return int(state["iteration"])
+
     def save_snapshot(self, iteration: int) -> None:
         import matplotlib
 
@@ -185,18 +245,33 @@ class SphereEscher:
         import matplotlib.pyplot as plt
 
         with torch.no_grad():
-            mv = orbit_views(4, distance=self.args.CAMERA_DISTANCE, elevation_deg=18.0)
-            images, alpha, _ = self.render(4, mv=mv)
+            # whole-sphere overview, plus one training-style close-up so both the tiling and
+            # the figure the model actually sees are visible in the same snapshot
+            wide = orbit_views(3, distance=self.args.PREVIEW_DISTANCE, elevation_deg=18.0)
+            images, alpha, points = self.render(3, mv=wide)
             comp = (images * alpha + 1.0 * (1 - alpha)).clamp(0, 1).cpu().numpy()
+
+            centers = self.tiler.tile_centers(points.detach().cpu().numpy())
+            close = tile_centric_views(
+                torch.as_tensor(centers, dtype=torch.float32),
+                1,
+                distance=self.args.CAMERA_DISTANCE,
+                angular_jitter_deg=0.0,
+            )
+            c_img, c_alpha, _ = self.render(1, mv=close)
+            close_up = (c_img * c_alpha + 1.0 * (1 - c_alpha)).clamp(0, 1).cpu().numpy()[0]
 
         fig, axes = plt.subplots(1, 5, figsize=(19, 4.2))
         axes[0].imshow(self.texture.detach().clamp(0, 1).cpu().numpy())
         axes[0].set_title("shared texture", fontsize=10)
         axes[0].set_xticks([])
         axes[0].set_yticks([])
-        for i in range(4):
+        for i in range(3):
             axes[i + 1].imshow(comp[i])
             axes[i + 1].set_axis_off()
+        axes[4].imshow(close_up)
+        axes[4].set_axis_off()
+        axes[4].set_title("what SDS sees", fontsize=10)
         fig.suptitle(f'step {iteration} — "{self.args.PROMPT}"', fontsize=12)
         fig.tight_layout()
         fig.savefig(self.output_dir / f"step_{iteration:05d}.png", dpi=110, bbox_inches="tight")
@@ -224,7 +299,9 @@ class SphereEscher:
                 if not ok:
                     print(f"  !! geometry check failed: {message}")
                 self.save_snapshot(iteration)
+                self.save_checkpoint(iteration)
 
+        self.save_checkpoint(a.N_STEPS)
         print(f"\ndone in {(time.time() - start) / 60:.1f} min -> {self.output_dir}")
 
 

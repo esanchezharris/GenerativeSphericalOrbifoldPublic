@@ -24,6 +24,7 @@ __all__ = [
     "orbit_views",
     "perspective",
     "random_views",
+    "tile_centric_views",
 ]
 
 
@@ -133,6 +134,51 @@ def random_views(
             rot = _slerp_to_identity(rot, jitter)
         directions = directions @ rot.T
     return _views_from_directions(directions, distance)
+
+
+def tile_centric_views(
+    tile_centers: Tensor,
+    n_views: int,
+    distance: float = 2.0,
+    angular_jitter_deg: float = 12.0,
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """``(n_views, 4, 4)`` views, each framing one tile rather than the whole sphere.
+
+    **Why this and not** :func:`random_views`. Score distillation asks the diffusion model to
+    make *the rendered image* match the prompt. The planar pipeline renders a single
+    fundamental domain filling the frame (``main.py`` leaves ``mv``/``proj`` at the identity),
+    so the model is being asked to make one tile look like a gingerbread man -- and the tiling
+    follows from the boundary conditions.
+
+    Framing the whole sphere instead asks it to make an entire multi-tile sphere look like one
+    gingerbread man, which it cannot do; the texture collapses into high-frequency noise. So
+    each view here points at a randomly chosen tile from close range.
+
+    Args:
+        tile_centers: ``(n_tiles, 3)`` unit vectors toward each tile's centroid.
+        distance: camera distance from the sphere centre. Smaller crops in harder.
+        angular_jitter_deg: random tilt away from the exact tile centre, for view diversity.
+    """
+    tile_centers = torch.as_tensor(tile_centers, dtype=torch.float32)
+    n_tiles = tile_centers.shape[0]
+
+    pick = torch.randint(0, n_tiles, (n_views,), generator=generator)
+    directions = tile_centers[pick].clone()
+
+    if angular_jitter_deg > 0:
+        # random small rotation: perturb by a tangential offset, then renormalise
+        noise = torch.randn(n_views, 3, generator=generator)
+        radial = (noise * directions).sum(-1, keepdim=True) * directions
+        tangent = noise - radial
+        tangent = tangent / tangent.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+        angle = torch.deg2rad(
+            torch.rand(n_views, 1, generator=generator) * angular_jitter_deg
+        )
+        directions = directions * torch.cos(angle) + tangent * torch.sin(angle)
+        directions = directions / directions.norm(dim=-1, keepdim=True)
+
+    return look_at(directions * distance)
 
 
 def orbit_views(n: int, distance: float = 3.0, elevation_deg: float = 20.0) -> Tensor:

@@ -185,6 +185,21 @@ class SphericalTiler:
         tile_index = np.repeat(np.arange(self.order), len(faces))
         return tiled, all_faces, tile_index
 
+    def tile_centers(self, points: np.ndarray) -> np.ndarray:
+        """``(|G|, 3)`` unit vector toward each copy's centroid.
+
+        Used to aim the camera at individual tiles during score distillation.
+        """
+        centroid = np.asarray(points, dtype=np.float64).mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm < 1e-9:
+            raise ValueError(
+                "the domain's centroid is at the origin, so it has no well-defined "
+                "direction to aim a camera at"
+            )
+        centroid = centroid / norm
+        return np.einsum("gij,j->gi", self.rotations, centroid)
+
     def tile_attribute(self, values: np.ndarray) -> np.ndarray:
         """Repeat a per-vertex attribute once per group element: ``(n, d)`` -> ``(|G|*n, d)``.
 

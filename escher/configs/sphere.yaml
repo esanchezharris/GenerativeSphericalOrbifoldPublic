@@ -19,23 +19,46 @@ W_RANGE: 0.95
 LR_W: 0.03
 
 ### texture
-TEXTURE_RESOLUTION: 512
-LR_TEXTURE: 0.02
+# One tile covers roughly 250 px of a 512 render, so a 512 texture is ~4x oversampled and
+# SDS fills the surplus with high-frequency noise instead of a figure. 256 matches better.
+TEXTURE_RESOLUTION: 256
+LR_TEXTURE: 0.01
 CLAMP_TEXTURE: true
 
 ### rendering
 IMAGE_BATCH_SIZE: 4   # views per step. 12 GB VRAM: 4 at 512 fits, 6 is tight.
 RENDER_SIZE: 512
-CAMERA_DISTANCE: 3.0
+# Aim each view at ONE tile, close up, rather than at the whole sphere. Score distillation
+# asks the model to make the rendered image match the prompt, so the frame has to contain a
+# figure-sized region -- the planar pipeline renders exactly one fundamental domain
+# (main.py leaves mv/proj at the identity). Framing the whole sphere asks the model to turn
+# an 8-tile ball into one gingerbread man, and the texture degenerates into noise.
+TILE_CENTRIC_VIEWS: true
+CAMERA_DISTANCE: 1.4  # cap half-angle ~44 deg: one tile dominant, neighbours visible
 CAMERA_FOV: 40.0
+VIEW_JITTER_DEG: 12.0
 RANDOM_BACKGROUND: true
+# Snapshots and turntables frame the whole sphere, unlike the close-up training views.
+PREVIEW_DISTANCE: 3.0
+# Half the steps render a SINGLE tile against the background instead of the full tiling.
+# The tiling covers every view completely, so it offers no silhouette -- without these steps
+# only the texture can respond to the prompt and the tile outline stays smooth. This is what
+# turns the tile SHAPE into the figure, which is the whole point of an Escher tiling.
+ISOLATED_TILE_FRACTION: 0.5
+# Must be close enough that the TILE fills the frame. At 2.6 a lone tile covers only ~1/8 of
+# the view, which teaches the model to paint small figures -- the opposite of what is wanted.
+ISOLATED_DISTANCE: 1.7
 
 ### guidance
-# base.yaml uses stabilityai/stable-diffusion-2-1-base, which is now gated on the Hub and
-# returns 401 without an accepted licence and a token. SD 1.5 is ungated, is what the
-# upstream work was originally built around, and its illustration prior suits Escher tiles.
-PRETRAINED_MODEL_NAME_OR_PATH: "runwayml/stable-diffusion-v1-5"
-GUIDANCE_SCALE: 100.0
+# base.yaml names stabilityai/stable-diffusion-2-1-base, which is now gated on the Hub and
+# 401s without an accepted licence and a token. This is an ungated third-party mirror of the
+# same weights in diffusers format -- same model as the original config, no auth needed.
+# Note it is a re-upload, so its provenance is weaker than an official repo; swap in
+# "runwayml/stable-diffusion-v1-5" (also ungated) if that matters for your use.
+PRETRAINED_MODEL_NAME_OR_PATH: "Manojb/stable-diffusion-2-1-base"
+# base.yaml uses 100. That suits the planar setup but here it drives the texture into
+# high-frequency artefacts; 50 trades a little prompt fidelity for markedly cleaner figures.
+GUIDANCE_SCALE: 50.0
 USE_HALF_PRECISION: true
 CLIP_GRADIENTS_IN_SDS: true
 
