@@ -184,6 +184,23 @@ class BoundaryExplicitDihedral:
                 raise AssertionError(role)
         return torch.stack(rows).reshape(-1)
 
+    def cotan_edge_weights(self) -> np.ndarray:
+        r"""Clamped cotangent weights of the base mesh, aligned with ``mesh.edges``.
+
+        The reference solver is built on these (``Solver.m``: ``L = cotmatrix(V,T)``, with
+        negatives clamped to 1e-3). They matter more than "just" fidelity: with **uniform**
+        weights the fixed-boundary solve of the undeformed lune already crushes the pole-fan
+        faces to a **0.105** minimum area ratio -- inside the fold margin before optimisation
+        even starts, which silently folded run B1 and made runs B2/B3 reject ~100% of steps.
+        With cotangent weights the same solve reproduces the lune to min ratio **0.998**.
+        """
+        import igl
+
+        L = igl.cotmatrix(self.mesh.points, self.mesh.faces.astype(np.int64))
+        w = np.asarray(L[self.mesh.edges[:, 0], self.mesh.edges[:, 1]]).ravel()
+        w[w < 1e-3] = 1e-3  # Solver.m's clamp for the occasional negative cotangent
+        return w
+
     def tiler(self) -> SphericalTiler:
         return SphericalTiler.dihedral(self.mesh.k)
 

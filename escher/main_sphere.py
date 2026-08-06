@@ -87,6 +87,7 @@ class SphereEscher:
                 self.b_orb.A,
                 self.b_orb.pin_order,
                 self.mesh.points,
+                weights=self.b_orb.cotan_edge_weights(),
                 warm_start=a.WARM_START,
             )
         else:

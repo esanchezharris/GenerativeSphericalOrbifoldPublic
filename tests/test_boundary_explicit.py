@@ -25,9 +25,37 @@ from escher.geometry.spherical_sanity_checks import (
 def small():
     orb = BoundaryExplicitDihedral.from_resolution(k=4, n_theta=6, n_phi=5)
     emb = BoundaryEmbedder(
-        orb.mesh.edges, orb.A, orb.pin_order, orb.mesh.points, warm_start=False
+        orb.mesh.edges, orb.A, orb.pin_order, orb.mesh.points,
+        weights=orb.cotan_edge_weights(), warm_start=False,
     )
     return orb, emb
+
+
+def test_cotan_weights_keep_the_init_solve_on_the_lune():
+    """The uniform-weights trap, pinned as a regression: with uniform interior weights the
+    init solve crushes pole-fan faces to ~0.10 of their area (inside the fold margin before
+    optimisation starts -- it silently folded B1 and stalled B2/B3 at ~100% rejection).
+    Cotangent weights, as the reference's Solver.m uses, reproduce the lune."""
+    from escher.OTE.core.spherical.regularizers import spherical_face_areas
+
+    orb = BoundaryExplicitDihedral.from_resolution(k=4, n_theta=14, n_phi=9)
+    ref = spherical_face_areas(
+        torch.as_tensor(orb.mesh.points, dtype=torch.float64),
+        torch.as_tensor(orb.mesh.faces, dtype=torch.long),
+    ).detach()
+
+    def min_ratio(weights):
+        emb = BoundaryEmbedder(
+            orb.mesh.edges, orb.A, orb.pin_order, orb.mesh.points,
+            weights=weights, warm_start=False,
+        )
+        with torch.no_grad():
+            pts = emb(orb.boundary_b(orb.initial_free_points()))
+        areas = spherical_face_areas(pts, torch.as_tensor(orb.mesh.faces, dtype=torch.long))
+        return float((areas / ref).min())
+
+    assert min_ratio(orb.cotan_edge_weights()) > 0.9
+    assert min_ratio(None) < 0.5, "uniform weights should still show the trap"
 
 
 def wiggled(orb, scale=0.06, seed=0) -> torch.Tensor:

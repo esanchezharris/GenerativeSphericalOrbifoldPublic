@@ -382,6 +382,7 @@ class BoundaryEmbedder:
         pin_order: np.ndarray,
         x0_points: np.ndarray,
         *,
+        weights: np.ndarray | None = None,
         warm_start: bool = True,
         tol_x: float = 1e-11,
         max_iter: int = 10_000,
@@ -396,8 +397,13 @@ class BoundaryEmbedder:
         self.tol_x = tol_x
         self.max_iter = max_iter
 
-        self.weights = np.ones(len(self.edges))
-        self.weights_t = torch.ones(len(self.edges), dtype=torch.float64)
+        # Interior edge weights are FIXED in this mode (the boundary is the variable).
+        # Production passes the base mesh's clamped cotangent weights -- see
+        # BoundaryExplicitDihedral.cotan_edge_weights for why uniform weights are a trap.
+        self.weights = (
+            np.ones(len(self.edges)) if weights is None else np.asarray(weights, float)
+        )
+        self.weights_t = torch.as_tensor(self.weights, dtype=torch.float64)
         self._laplacian = laplacian_from_edges(self.edges, self.weights, self.n_verts)
 
         self._last_x: np.ndarray | None = None
