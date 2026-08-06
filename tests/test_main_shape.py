@@ -104,6 +104,26 @@ def test_scaled_n_phi():
         assert n % 2 == 1 and n >= 5
 
 
+def test_cross_phase_resume_keeps_fresh_texture(tmp_path):
+    """Texture phase resuming a shape checkpoint: shape FROM the checkpoint, texture
+    from this run's init -- the shape phase never trained its texture."""
+    args = tiny_args(tmp_path)
+    donor = build_shape_run(args)
+    with torch.no_grad():
+        donor.P.add_(0.01)
+    path = donor.save_checkpoint(7)
+
+    args2 = tiny_args(tmp_path)
+    args2.OUTPUT_DIR = str(tmp_path / "tex")
+    args2.TEXTURE_INIT_COLOR = [0.76, 0.60, 0.42]
+    args2.RESET_TEXTURE_ON_RESUME = True
+    e = build_shape_run(args2)
+    assert e.load_checkpoint(path) == 7
+    assert torch.allclose(e.P.detach(), donor.P.detach()), "shape comes from checkpoint"
+    tan = torch.tensor([0.76, 0.60, 0.42])
+    assert torch.allclose(e.texture.detach()[0, 0], tan), "texture keeps the fresh init"
+
+
 def test_texture_init_color(tmp_path):
     args = tiny_args(tmp_path)
     assert args.TEXTURE_INIT_COLOR is None

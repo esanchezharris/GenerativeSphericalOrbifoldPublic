@@ -603,7 +603,12 @@ class SphereEscher:
                 self.P.copy_(state["P"])
             else:
                 self.W.copy_(state["W"])
-            self.texture.copy_(state["texture"].to(self.device))
+            # Cross-phase resume (texture run from a shape-phase checkpoint): take the
+            # SHAPE from the checkpoint but keep this run's fresh texture init -- the
+            # shape phase never trained its texture, so loading it would just replace
+            # the configured flat-color start with stale gray.
+            if not self.args.get("RESET_TEXTURE_ON_RESUME", False):
+                self.texture.copy_(state["texture"].to(self.device))
         self.optimizer.load_state_dict(state["optimizer"])
         return int(state["iteration"])
 

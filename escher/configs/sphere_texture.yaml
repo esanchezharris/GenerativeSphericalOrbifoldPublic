@@ -15,8 +15,10 @@ NEGATIVE_PROMPT: "noisy, grainy, photorealistic, 3d render, blurry, cluttered ba
 FREEZE_SHAPE_AFTER: 0
 SILHOUETTE_WEIGHT: 0.0
 
-# Flat gingerbread tan, not gray/noise: the figure's base coat is already on.
+# Flat gingerbread tan, not gray/noise: the figure's base coat is already on. The
+# resume flag keeps this init instead of the shape checkpoint's untrained gray.
 TEXTURE_INIT_COLOR: [0.76, 0.60, 0.42]
+RESET_TEXTURE_ON_RESUME: true
 
 # Compose early, polish late (see sphere.yaml).
 SDS_ANNEAL_END: 800
