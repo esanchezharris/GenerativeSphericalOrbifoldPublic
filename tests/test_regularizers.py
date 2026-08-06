@@ -154,6 +154,39 @@ def test_tail_term_ignores_uniform_deformation(lune):
     assert tail_v == pytest.approx(mean_v, rel=1e-6)
 
 
+# ---------------------------------------------------------------------- margin hinge
+def test_margin_hinge_is_zero_in_healthy_states(lune):
+    from escher.OTE.core.spherical.regularizers import area_margin_loss
+
+    faces = torch.as_tensor(lune.faces, dtype=torch.long)
+    ref = spherical_face_areas(as_t(lune.points), faces).detach()
+    assert float(area_margin_loss(as_t(lune.points), faces, ref)) == 0.0
+
+
+def test_margin_hinge_ramps_toward_and_through_the_fold(lune):
+    """The barrier must grade smoothly BEFORE the sign change and keep growing after it --
+    that is what gives Adam the wall rejection could not."""
+    from escher.OTE.core.spherical.regularizers import area_margin_loss
+
+    faces = torch.as_tensor(lune.faces, dtype=torch.long)
+    ref = spherical_face_areas(as_t(lune.points), faces).detach()
+    rng = np.random.default_rng(7)
+    noise = rng.normal(size=lune.points.shape)
+
+    losses = []
+    for scale in (0.10, 0.20, 0.35):
+        p = lune.points + scale * noise
+        p /= np.linalg.norm(p, axis=1, keepdims=True)
+        losses.append(float(area_margin_loss(as_t(p), faces, ref)))
+    assert losses[-1] > 0, "large distortion must engage the hinge"
+    assert losses == sorted(losses), "hinge must ramp monotonically with distortion"
+
+    pts = as_t(lune.points + 0.25 * noise)
+    pts = (pts / pts.norm(dim=-1, keepdim=True)).requires_grad_(True)
+    area_margin_loss(pts, faces, ref).backward()
+    assert torch.isfinite(pts.grad).all()
+
+
 # ------------------------------------------------- the property that earns the GPU run
 def test_regularizer_steers_weights_back_toward_uniform_through_the_solve():
     """Distort the embedding via non-uniform weights, then minimize ONLY the equal-area

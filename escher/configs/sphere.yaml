@@ -15,7 +15,13 @@ NEGATIVE_PROMPT: ""
 PARAM_MODE: "boundary"
 LR_BOUNDARY: 0.004     # boundary points move in radians; far smaller scale than weight logits
 BOUNDARY_SPACING_WEIGHT: 3000.0   # variance of segment lengths -- prevents bunching
-BOUNDARY_SMOOTH_WEIGHT: 500.0     # second differences -- discourages jagged, crossing curves
+BOUNDARY_SMOOTH_WEIGHT: 1000.0    # second differences -- discourages jagged, crossing curves
+# Hinge barrier on per-face area ratio: zero while every face keeps >= MARGIN of its
+# reference area, ramping quadratically toward the fold. Rejection (undo folding steps)
+# stays on as the hard guarantee; without this gradient it rejected 78% of steps and the
+# outline stalled -- Adam kept ramming a wall it could not feel.
+BOUNDARY_MARGIN: 0.15
+BOUNDARY_MARGIN_WEIGHT: 50000.0
 
 ### orbifold
 # Cone orders (K, 2, 2): the dihedral group D_K, giving 2*K tiles on the sphere.

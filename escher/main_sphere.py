@@ -37,6 +37,7 @@ from omegaconf import OmegaConf
 from escher.OTE.core.spherical.differentiable import BoundaryEmbedder, SphericalEmbedder
 from escher.OTE.tilings_sphere.boundary_explicit import BoundaryExplicitDihedral
 from escher.OTE.core.spherical.regularizers import (
+    area_margin_loss,
     area_tail_loss,
     equal_area_loss,
     spherical_face_areas,
@@ -436,6 +437,10 @@ class SphereEscher:
                 )
             if a.PARAM_MODE == "boundary":
                 reg = reg + self.boundary_chain_regularizers()
+                if a.BOUNDARY_MARGIN_WEIGHT > 0:
+                    reg = reg + a.BOUNDARY_MARGIN_WEIGHT * area_margin_loss(
+                        points, self.faces_t, self.ref_areas, margin=a.BOUNDARY_MARGIN
+                    )
             elif a.W_REGULARIZATION > 0:
                 reg = reg + a.W_REGULARIZATION * (self.W**2).sum()
         if torch.is_tensor(reg):

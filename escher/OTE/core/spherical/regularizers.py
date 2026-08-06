@@ -21,7 +21,32 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-__all__ = ["area_tail_loss", "equal_area_loss", "spherical_face_areas"]
+__all__ = [
+    "area_margin_loss",
+    "area_tail_loss",
+    "equal_area_loss",
+    "spherical_face_areas",
+]
+
+
+def area_margin_loss(
+    points: "Tensor", faces: "Tensor", reference_areas: "Tensor", margin: float = 0.15
+) -> "Tensor":
+    r"""Hinge barrier keeping every face's area ratio above ``margin``.
+
+    :math:`\sum_i \mathrm{relu}(m - a_i/a_i^0)^2` -- exactly zero while all faces hold a
+    healthy fraction of their reference area, ramping quadratically as any face approaches
+    the fold at ratio 0 (and growing through it, since the ratio goes negative).
+
+    Why this exists, measured: rejection alone (undo folding steps) kept run B2 valid but
+    rejected **78% of steps** -- Adam has no gradient telling it the wall is there, so it
+    rams the same direction forever and the outline stalls. The hinge supplies that
+    gradient. Rejection stays on as the hard guarantee; this makes it rarely needed.
+    Diagnostic basis: run B1's folds were boundary-adjacent interior faces (12/19), i.e.
+    approachable smoothly -- a barrier can catch them before the sign change.
+    """
+    ratio = spherical_face_areas(points, faces) / reference_areas
+    return torch.relu(margin - ratio).square().sum()
 
 
 def spherical_face_areas(points: Tensor, faces: Tensor) -> Tensor:
