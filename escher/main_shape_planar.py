@@ -124,7 +124,9 @@ def prepare_target(escher: Escher, ctx: PlanarShapeContext, args) -> torch.Tenso
     with torch.no_grad():
         alpha0 = soft_alpha_planar(solve_tile(escher), ctx)[0, ..., 0].cpu().numpy()
 
-    aligned, params, iou = align_mask_to(alpha0, raw)
+    aligned, params, iou = align_mask_to(
+        alpha0, raw, match_area=bool(args.get("MATCH_TILE_AREA", True))
+    )
     print(
         f"target aligned: scale {params['scale']:.3f}, angle {params['angle_deg']:+.1f} deg, "
         f"initial IoU {iou:.3f}"

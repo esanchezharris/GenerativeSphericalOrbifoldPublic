@@ -94,6 +94,16 @@ def _iou_np(a, b):
     return np.logical_and(a, b).sum() / max(np.logical_or(a, b).sum(), 1)
 
 
+def test_match_area_alignment_equalizes_areas():
+    """Area-matched mode: the aligned target's area must equal the reference's, because
+    the tile's area is conserved and a smaller target caps IoU structurally."""
+    ref = ellipse((128, 128), (64, 64), 40, 30)
+    small = ellipse((128, 128), (64, 64), 20, 15)  # a quarter of the area
+    aligned, _, _ = align_mask_to(ref, small, match_area=True)
+    ref_area = (ref > 0.5).sum()
+    assert abs((aligned > 0.5).sum() - ref_area) / ref_area < 0.05
+
+
 # ---------------------------------------------------------------------- soft IoU
 def test_soft_iou_hand_computed():
     target = torch.ones(8, 8)

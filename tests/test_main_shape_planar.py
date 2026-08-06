@@ -79,6 +79,10 @@ def test_initial_state_is_the_undeformed_tile(tmp_path):
     e = build_planar_shape_run(args)
     assert torch.allclose(e.W.detach(), torch.zeros_like(e.W))
     mapped = solve_tile(e)
-    # OrbifoldI pins its corners at (+-1, +-1); the uniform-weight solve must stay a
-    # sane square-ish tile inside that box
-    assert mapped.detach().abs().max() <= 1.0 + 1e-6
+    # Group-agnostic sanity: the uniform-weight tile stays near the unit square (the
+    # torus solve bulges mildly past 1.0, unlike OrbifoldI's hard corner pins) and is
+    # fold-free.
+    assert mapped.detach().abs().max() <= 1.5
+    from escher.geometry.sanity_checks import check_triangle_orientation
+
+    check_triangle_orientation(mapped, e.faces)

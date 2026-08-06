@@ -3,6 +3,11 @@
 
 # The mask from make_target.py (npy or png; npy is the chosen candidate).
 TARGET_MASK: "assets/targets/gingerbread/target.npy"
+# The tile's area is PINNED (the tiling must cover 4pi, so each tile owns 4pi/|G|); a
+# smaller aligned target caps IoU at target_area/tile_area structurally. Area-matched
+# alignment lifts the cap (measured: the free-scale planar carve converged to exactly
+# its area ratio, 0.71).
+MATCH_TILE_AREA: true
 
 # Calibrated by grid at the fixed framing (120-step probes, ~20 s each): weight 5000
 # with softened chain regs climbs IoU 0.695 -> 0.75 and perim to ~1.18 with ZERO folds

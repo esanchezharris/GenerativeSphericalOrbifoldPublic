@@ -10,6 +10,10 @@ TILING_TYPE: "Torus"
 MESH_RESOLUTION: 50
 
 TARGET_MASK: "assets/targets/gingerbread/target.npy"   # same target as the sphere
+# The torus tile's area is fixed (it must tile the plane): a smaller target caps IoU
+# at target_area/tile_area -- measured, the free-scale run converged to exactly that
+# ratio (0.7106). Area-matched alignment removes the structural cap.
+MATCH_TILE_AREA: true
 MASK_LOSS_WEIGHT: 5000.0     # sphere-calibrated prior; recalibrate by short probe
 MASK_PYRAMID_LEVELS: 7
 MASK_TAU: 3.0

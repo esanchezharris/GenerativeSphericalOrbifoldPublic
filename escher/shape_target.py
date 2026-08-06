@@ -95,6 +95,7 @@ def align_mask_to(
     target: np.ndarray,
     scales: tuple[float, float, int] = (0.6, 1.3, 15),
     angles_deg: tuple[float, float, int] = (-90.0, 90.0, 25),
+    match_area: bool = False,
 ) -> tuple[np.ndarray, dict, float]:
     """Place ``target`` over ``reference`` by a similarity transform, maximizing IoU.
 
@@ -105,6 +106,14 @@ def align_mask_to(
     them, with the translation re-derived from centroids at each candidate. One-time,
     CPU, seconds.
 
+    ``match_area=True`` replaces the scale search with the single AREA-MATCHED scale
+    (target area == reference area), searching only rotation. This matters whenever the
+    tile's area is conserved -- which is every orbifold parameterization here: the
+    tiling must cover its surface, so the tile's area is pinned at ``|surface|/|G|``
+    and a smaller target caps IoU at ``target_area / tile_area`` STRUCTURALLY.
+    Measured: the planar torus carve converged to 0.7106 with the free-scale
+    alignment's area ratio at exactly 0.71.
+
     Returns ``(aligned_mask, {"scale", "angle_deg", "shift"}, best_iou)`` with
     ``aligned_mask`` sampled on the reference's grid.
     """
@@ -114,8 +123,14 @@ def align_mask_to(
     c_tgt, r_tgt = _moments(tgt)
     base_scale = r_ref / r_tgt
 
+    if match_area:
+        area_scale = float(np.sqrt((ref > 0.5).sum() / max((tgt > 0.5).sum(), 1)))
+        scale_grid = [area_scale / base_scale]  # one multiplier: exact area match
+    else:
+        scale_grid = np.linspace(*scales)
+
     best = (None, None, -1.0)
-    for mult in np.linspace(*scales):
+    for mult in scale_grid:
         for angle in np.linspace(*angles_deg):
             s = base_scale * mult
             theta = np.deg2rad(angle)
