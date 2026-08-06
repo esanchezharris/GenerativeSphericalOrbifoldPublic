@@ -55,6 +55,18 @@ from escher.rendering.render_sphere_nvdiffrast import build_tiled_sphere, render
 PATH = Path(__file__).parent.absolute()
 
 
+def texture_tv(texture: torch.Tensor) -> torch.Tensor:
+    """Mean squared finite differences of the texture -- the anti-"knitted" prior.
+
+    SDS's leftover high-frequency structure reads as yarn/fabric; the target style is
+    flat fills. A gentle total-variation-style term pushes toward flat regions while
+    leaving edges (whose cost is localized) affordable.
+    """
+    dx = texture[1:, :] - texture[:-1, :]
+    dy = texture[:, 1:] - texture[:, :-1]
+    return dx.square().mean() + dy.square().mean()
+
+
 def annealed_max_step(args, iteration: int) -> float:
     """Linear anneal of the SDS max-timestep fraction over ``[0, SDS_ANNEAL_END]``.
 
@@ -485,6 +497,11 @@ class SphereEscher:
                     )
             elif a.W_REGULARIZATION > 0:
                 reg = reg + a.W_REGULARIZATION * (self.W**2).sum()
+        # The TV term lives on the texture's own device/dtype, so it adds to the loss
+        # directly (unlike the float64 CPU shape regs, which need the .to()).
+        tv_w = a.get("TEXTURE_TV_WEIGHT", 0.0)
+        if tv_w > 0:
+            loss = loss + tv_w * texture_tv(self.texture)
         if torch.is_tensor(reg):
             loss = loss + reg.to(loss)
 

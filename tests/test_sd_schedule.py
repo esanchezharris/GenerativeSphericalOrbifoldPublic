@@ -52,6 +52,22 @@ def test_set_step_range_moves_the_sampling_window():
     assert (g.min_step, g.max_step) == (20, 500)
 
 
+def test_texture_tv_prior():
+    import torch
+
+    from escher.main_sphere import texture_tv
+
+    flat = torch.full((8, 8, 3), 0.42)
+    assert texture_tv(flat).item() == pytest.approx(0.0, abs=1e-12)
+
+    noisy = torch.rand(8, 8, 3, generator=torch.Generator().manual_seed(0))
+    assert texture_tv(noisy).item() > 0.05
+
+    grad_check = torch.rand(8, 8, 3, requires_grad=True)
+    texture_tv(grad_check).backward()
+    assert grad_check.grad is not None and grad_check.grad.abs().sum() > 0
+
+
 def test_annealed_max_step_endpoints_and_clamp():
     from omegaconf import OmegaConf
 
