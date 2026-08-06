@@ -2,10 +2,11 @@
 # Full-mesh deformation (all edge weights through the planar orbifold-Tutte solve)
 # against a fixed silhouette target: the GEM mechanism with a deterministic signal.
 
-# 442 rotation-only pairing: the rotational orbifold closest to the spherical
-# rotation-pair structure, with four pinned corners anchoring scale. Torus is the
-# fallback if the corner pins prove restrictive.
-TILING_TYPE: "OrbifoldI"
+# Torus (translations only): NO pinned corners, so the whole boundary is free to
+# become the figure. OrbifoldI (442) was the first choice and hit its structural
+# ceiling immediately: its four pinned corners force the tile to reach into all four
+# square corners forever, capping IoU at ~0.68 against a figure that covers none.
+TILING_TYPE: "Torus"
 MESH_RESOLUTION: 50
 
 TARGET_MASK: "assets/targets/gingerbread/target.npy"   # same target as the sphere
