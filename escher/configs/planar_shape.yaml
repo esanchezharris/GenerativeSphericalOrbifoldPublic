@@ -29,7 +29,11 @@ PERIMETER_WEIGHT: 100.0
 # The figure's outline is legitimately longer than the square; hinging at exactly
 # perimeter0 froze the run at IoU 0.685. Free growth up to 1.6x, expensive beyond.
 PERIMETER_SLACK: 1.6
+# Anti-tendril, both proven sphere-side: second differences kill hairs specifically,
+# the top-5% area tail punishes the slivers behind them (the MEAN dilutes to nothing).
+BOUNDARY_SMOOTH_WEIGHT_2D: 5000.0
 EQUAL_AREA_WEIGHT_2D: 50.0
+AREA_TAIL_WEIGHT_2D: 200.0
 SEED: 0
 
 DEVICE: "cpu"                # the solve is CPU; cuda only accelerates the mask field

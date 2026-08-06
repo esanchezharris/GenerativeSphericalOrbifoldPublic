@@ -156,15 +156,25 @@ def shape_step(escher, optimizer, target, ctx: PlanarShapeContext, args) -> dict
     reg = args.W_REGULARIZATION * (escher.W**2).sum()
     # Slack matters: the figure's outline is legitimately LONGER than the undeformed
     # square (hinging at perimeter0 exactly froze the run at IoU 0.685); the hinge only
-    # exists to make runaway tendrils expensive.
+    # exists to make runaway growth expensive.
     reg = reg + args.PERIMETER_WEIGHT * torch.relu(
         perimeter - args.PERIMETER_SLACK * ctx.perimeter0
     )
-    if args.EQUAL_AREA_WEIGHT_2D > 0:
-        areas = planar_face_areas(mapped, escher.faces)
-        reg = reg + args.EQUAL_AREA_WEIGHT_2D * (
-            (areas / ctx.ref_areas - 1.0) ** 2
-        ).mean()
+    # The actual anti-TENDRIL terms, both proven sphere-side. Second differences kill
+    # hairs specifically (a spike is all curvature; a lobe is cheap) -- the planar
+    # linear Tutte lacks the Karcher energy's intrinsic smoothing that kept the
+    # spherical weights runs lobe-shaped. The top-5% area tail punishes the stretched
+    # slivers behind a spike, which the MEAN drift dilutes into nothing (measured:
+    # tendrils at mean-only, any weight).
+    second = boundary.roll(-1, 0) - 2 * boundary + boundary.roll(1, 0)
+    reg = reg + args.BOUNDARY_SMOOTH_WEIGHT_2D * second.square().sum()
+    if args.EQUAL_AREA_WEIGHT_2D > 0 or args.AREA_TAIL_WEIGHT_2D > 0:
+        drift = (planar_face_areas(mapped, escher.faces) / ctx.ref_areas - 1.0) ** 2
+        if args.EQUAL_AREA_WEIGHT_2D > 0:
+            reg = reg + args.EQUAL_AREA_WEIGHT_2D * drift.mean()
+        if args.AREA_TAIL_WEIGHT_2D > 0:
+            k = max(1, int(0.05 * drift.numel()))
+            reg = reg + args.AREA_TAIL_WEIGHT_2D * drift.topk(k).values.mean()
     loss = mask + reg.to(mask)
     loss.backward()
     optimizer.step()
