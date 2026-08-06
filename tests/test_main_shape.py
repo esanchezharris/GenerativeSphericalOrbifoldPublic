@@ -116,12 +116,23 @@ def test_cross_phase_resume_keeps_fresh_texture(tmp_path):
     args2 = tiny_args(tmp_path)
     args2.OUTPUT_DIR = str(tmp_path / "tex")
     args2.TEXTURE_INIT_COLOR = [0.76, 0.60, 0.42]
-    args2.RESET_TEXTURE_ON_RESUME = True
     e = build_shape_run(args2)
-    assert e.load_checkpoint(path) == 7
+    assert e.load_checkpoint(path, reset_texture=True) == 7
     assert torch.allclose(e.P.detach(), donor.P.detach()), "shape comes from checkpoint"
     tan = torch.tensor([0.76, 0.60, 0.42])
     assert torch.allclose(e.texture.detach()[0, 0], tan), "texture keeps the fresh init"
+
+    # The DEFAULT (render_final's path) must load the trained texture even when the
+    # checkpoint's own saved config carries RESET_TEXTURE_ON_RESUME -- reading the flag
+    # ambiently once rendered a finished run as flat init blobs.
+    args3 = tiny_args(tmp_path)
+    args3.OUTPUT_DIR = str(tmp_path / "render")
+    args3.RESET_TEXTURE_ON_RESUME = True
+    r = build_shape_run(args3)
+    r.load_checkpoint(path)
+    assert torch.allclose(r.texture.detach(), donor.texture.detach().cpu()), (
+        "plain load must take the checkpoint texture"
+    )
 
 
 def test_texture_init_color(tmp_path):

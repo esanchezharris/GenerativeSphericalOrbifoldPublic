@@ -596,18 +596,19 @@ class SphereEscher:
         torch.save(payload, self.output_dir / "checkpoint.pt")
         return tagged
 
-    def load_checkpoint(self, path: str | Path) -> int:
+    def load_checkpoint(self, path: str | Path, reset_texture: bool = False) -> int:
+        """``reset_texture`` is a PER-CALL choice, never read from config: the flag ends
+        up saved inside the checkpoint's own config, and reading it ambiently made
+        render_final load a texture-phase checkpoint as flat init blobs. Only run()'s
+        cross-phase RESUME wants it (shape from the checkpoint, this run's fresh
+        texture -- the shape phase never trained its texture)."""
         state = torch.load(path, map_location="cpu", weights_only=False)
         with torch.no_grad():
             if "P" in state:
                 self.P.copy_(state["P"])
             else:
                 self.W.copy_(state["W"])
-            # Cross-phase resume (texture run from a shape-phase checkpoint): take the
-            # SHAPE from the checkpoint but keep this run's fresh texture init -- the
-            # shape phase never trained its texture, so loading it would just replace
-            # the configured flat-color start with stale gray.
-            if not self.args.get("RESET_TEXTURE_ON_RESUME", False):
+            if not reset_texture:
                 self.texture.copy_(state["texture"].to(self.device))
         self.optimizer.load_state_dict(state["optimizer"])
         return int(state["iteration"])
@@ -672,7 +673,13 @@ class SphereEscher:
         a = self.args
         first_step = 0
         if resume_from is not None:
-            first_step = self.load_checkpoint(resume_from) + 1
+            first_step = (
+                self.load_checkpoint(
+                    resume_from,
+                    reset_texture=a.get("RESET_TEXTURE_ON_RESUME", False),
+                )
+                + 1
+            )
             print(f"resuming from {resume_from} at step {first_step}")
             if first_step >= a.N_STEPS:
                 print("checkpoint is already at or past N_STEPS; nothing to do")
