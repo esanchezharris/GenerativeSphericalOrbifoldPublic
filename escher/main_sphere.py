@@ -108,13 +108,26 @@ class SphereEscher:
         )
         self.guidance = sd.StableDiffusion(cfg)
         with torch.no_grad():
-            positive = self.guidance.get_text_embeds(a.PROMPT)
-            negative = self.guidance.get_text_embeds(a.NEGATIVE_PROMPT)
-            batch = a.IMAGE_BATCH_SIZE
-            self.text_embeds = torch.cat([positive] * batch + [negative] * batch)
+            self._positive = self.guidance.get_text_embeds(a.PROMPT)
+            self._negative = self.guidance.get_text_embeds(a.NEGATIVE_PROMPT)
+        self.text_embeds = self.text_embeds_for(a.IMAGE_BATCH_SIZE)
         del self.guidance.text_encoder
         torch.cuda.empty_cache()
         print(f'prompt: "{a.PROMPT}"')
+
+    def text_embeds_for(self, batch: int) -> torch.Tensor:
+        """``[2*batch, 77, D]`` embeddings: positives then negatives.
+
+        Cached per batch size, because the silhouette pass may use a different one from the
+        main pass and ``train_step`` requires the two to line up.
+        """
+        if not hasattr(self, "_embed_cache"):
+            self._embed_cache: dict[int, torch.Tensor] = {}
+        if batch not in self._embed_cache:
+            self._embed_cache[batch] = torch.cat(
+                [self._positive] * batch + [self._negative] * batch
+            )
+        return self._embed_cache[batch]
 
     # -------------------------------------------------------------------------- step
     def edge_weights(self) -> torch.Tensor:
@@ -123,7 +136,11 @@ class SphereEscher:
         return torch.special.expit(self.W) * self.args.W_RANGE + r
 
     def render(
-        self, n_views: int, mv: torch.Tensor | None = None, isolated: bool = False
+        self,
+        n_views: int,
+        mv: torch.Tensor | None = None,
+        isolated: bool = False,
+        texture: torch.Tensor | None = None,
     ):
         """Render the tiling, or a single tile alone against the background.
 
@@ -150,7 +167,7 @@ class SphereEscher:
             )
         images, alpha = render_tiled_sphere(
             sphere,
-            self.texture,
+            self.texture if texture is None else texture,
             n_views=n_views,
             image_size=self.args.RENDER_SIZE,
             distance=self.args.CAMERA_DISTANCE,
@@ -158,6 +175,46 @@ class SphereEscher:
             mv=mv,
         )
         return images, alpha, points
+
+    @property
+    def solid_texture(self) -> torch.Tensor:
+        """A constant-colour texture, used for the silhouette pass.
+
+        Not a parameter: it carries no gradient, which is exactly the point.
+        """
+        if not hasattr(self, "_solid_texture"):
+            self._solid_texture = torch.full(
+                (8, 8, 3),
+                float(self.args.SILHOUETTE_FIGURE_VALUE),
+                device=self.device,
+                dtype=torch.float32,
+            )
+        return self._solid_texture
+
+    def silhouette_loss(self, n_views: int) -> torch.Tensor:
+        r"""SDS on a flat-coloured, untextured tile: a pure *shape* signal.
+
+        The textured passes let the optimiser cheat. It can paint a convincing gingerbread
+        man **inside** an unchanged tile, because the texture has far more capacity than the
+        outline and is the easier descent direction. The tile then stays a smooth lune with a
+        picture on it, which is not an Escher tiling -- in a real one the *outline itself* is
+        the figure, which is what makes neighbours interlock.
+
+        Rendering the tile as a solid colour on a contrasting background removes that escape
+        route: the interior is constant, so the only thing that can change the image is the
+        silhouette. nvdiffrast's ``antialias`` supplies the vertex-position gradients along
+        those boundary edges, and they reach the edge weights through the implicit solve.
+        The texture receives nothing from this term.
+        """
+        images, alpha, _ = self.render(
+            n_views, isolated=True, texture=self.solid_texture
+        )
+        background = torch.full_like(images, float(self.args.SILHOUETTE_BACKGROUND_VALUE))
+        composited = images * alpha + background * (1.0 - alpha)
+        loss, _ = self.guidance.train_step(
+            composited, self.text_embeds_for(n_views)
+        )
+        return loss
 
     @property
     def solo_tiler(self):
@@ -187,6 +244,19 @@ class SphereEscher:
 
         # train_step returns (loss, sampled timestep); the timestep is diagnostic only.
         loss, timestep = self.guidance.train_step(composited, self.text_embeds)
+
+        sil = 0.0
+        use_silhouette = (
+            a.SILHOUETTE_WEIGHT > 0
+            and a.SILHOUETTE_EVERY > 0
+            and iteration % a.SILHOUETTE_EVERY == 0
+            and iteration < a.FREEZE_SHAPE_AFTER
+        )
+        if use_silhouette:
+            sil_loss = self.silhouette_loss(a.SILHOUETTE_BATCH_SIZE)
+            loss = loss + a.SILHOUETTE_WEIGHT * sil_loss
+            sil = float(sil_loss.detach())
+
         loss.backward()
 
         if iteration >= a.FREEZE_SHAPE_AFTER and self.W.grad is not None:
@@ -195,6 +265,7 @@ class SphereEscher:
         self.optimizer.step()
         return {
             "loss": float(loss.detach()),
+            "silhouette": sil,
             "timestep": float(timestep.float().mean()),
             "energy": self.embedder.last_result.energy,
             "solver_iters": (
@@ -288,8 +359,11 @@ class SphereEscher:
                 elapsed = time.time() - start
                 per_step = elapsed / max(iteration, 1)
                 mem = torch.cuda.max_memory_allocated() / 2**30
+                sil = (
+                    f"sil {info['silhouette']:9.1f} | " if info.get("silhouette") else ""
+                )
                 print(
-                    f"step {iteration:5d} | loss {info['loss']:9.4f} | "
+                    f"step {iteration:5d} | loss {info['loss']:9.1f} | {sil}"
                     f"karcher {info['energy']:8.4f} | solver {info['solver_iters']:3d} it | "
                     f"{per_step:5.2f} s/step | {mem:4.1f} GiB"
                 )
