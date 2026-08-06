@@ -35,11 +35,13 @@ import torch
 from omegaconf import OmegaConf
 
 from escher.OTE.core.spherical.differentiable import SphericalEmbedder
+from escher.OTE.core.spherical.regularizers import equal_area_loss, spherical_face_areas
 from escher.OTE.tilings_sphere import DihedralOrbifold
 from escher.geometry.spherical_sanity_checks import (
     boundary_arc_ratio,
     check_covers_sphere_once,
     count_flipped_faces,
+    signed_solid_angles,
 )
 from escher.rendering.camera import orbit_views, tile_centric_views
 from escher.rendering.render_sphere_nvdiffrast import build_tiled_sphere, render_tiled_sphere
@@ -100,6 +102,14 @@ class SphereEscher:
             ]
         )
 
+        # Reference state for the equal-area regularizer: the undeformed lune's own
+        # per-face solid angles (its faces legitimately differ in size).
+        self.faces_t = torch.as_tensor(self.mesh.faces, dtype=torch.long)
+        self.ref_areas = spherical_face_areas(
+            torch.as_tensor(self.mesh.points, dtype=torch.float64), self.faces_t
+        ).detach()
+        assert (self.ref_areas > 0).all(), "undeformed mesh must be fold-free"
+
     def _init_guidance(self):
         import escher.guidance.sd as sd
 
@@ -111,27 +121,38 @@ class SphereEscher:
             grad_clip=[0, 2.0, 8.0, 1000] if a.CLIP_GRADIENTS_IN_SDS else None,
         )
         self.guidance = sd.StableDiffusion(cfg)
+        # The silhouette pass shows the model a flat solid shape, so it gets a prompt that
+        # DESCRIBES a flat solid shape. Reusing the main prompt there asks for color and
+        # interior detail the pass cannot express; the score's pull toward those attributes
+        # leaks through the boundary antialiasing pixels as directionless pressure, which
+        # grows the perimeter without shaping it -- the measured failure of the
+        # no-regularizer strong-silhouette run.
+        sil_prompt = a.SILHOUETTE_PROMPT or a.PROMPT
         with torch.no_grad():
             self._positive = self.guidance.get_text_embeds(a.PROMPT)
+            self._sil_positive = self.guidance.get_text_embeds(sil_prompt)
             self._negative = self.guidance.get_text_embeds(a.NEGATIVE_PROMPT)
         self.text_embeds = self.text_embeds_for(a.IMAGE_BATCH_SIZE)
         del self.guidance.text_encoder
         torch.cuda.empty_cache()
         print(f'prompt: "{a.PROMPT}"')
+        print(f'silhouette prompt: "{sil_prompt}"')
 
-    def text_embeds_for(self, batch: int) -> torch.Tensor:
+    def text_embeds_for(self, batch: int, silhouette: bool = False) -> torch.Tensor:
         """``[2*batch, 77, D]`` embeddings: positives then negatives.
 
-        Cached per batch size, because the silhouette pass may use a different one from the
-        main pass and ``train_step`` requires the two to line up.
+        Cached per (pass kind, batch size): the silhouette pass has its own prompt and may
+        use a different batch from the main pass, and ``train_step`` needs them to line up.
         """
         if not hasattr(self, "_embed_cache"):
-            self._embed_cache: dict[int, torch.Tensor] = {}
-        if batch not in self._embed_cache:
-            self._embed_cache[batch] = torch.cat(
-                [self._positive] * batch + [self._negative] * batch
+            self._embed_cache: dict[tuple[bool, int], torch.Tensor] = {}
+        key = (silhouette, batch)
+        if key not in self._embed_cache:
+            positive = self._sil_positive if silhouette else self._positive
+            self._embed_cache[key] = torch.cat(
+                [positive] * batch + [self._negative] * batch
             )
-        return self._embed_cache[batch]
+        return self._embed_cache[key]
 
     # -------------------------------------------------------------------------- step
     def edge_weights(self) -> torch.Tensor:
@@ -216,7 +237,7 @@ class SphereEscher:
         background = torch.full_like(images, float(self.args.SILHOUETTE_BACKGROUND_VALUE))
         composited = images * alpha + background * (1.0 - alpha)
         loss, _ = self.guidance.train_step(
-            composited, self.text_embeds_for(n_views)
+            composited, self.text_embeds_for(n_views, silhouette=True)
         )
         return loss
 
@@ -237,7 +258,9 @@ class SphereEscher:
 
         # Alternate between the two framings. Isolated views give SDS a silhouette to shape
         # the tile outline with; tiled views make the texture read correctly in context.
-        isolated = (iteration % 2 == 0) and a.ISOLATED_TILE_FRACTION > 0
+        # The fraction sets the actual cadence (0.5 -> every 2nd step), not just on/off.
+        frac = a.ISOLATED_TILE_FRACTION
+        isolated = frac > 0 and iteration % max(1, round(1.0 / frac)) == 0
         images, alpha, points = self.render(a.IMAGE_BATCH_SIZE, isolated=isolated)
 
         if a.RANDOM_BACKGROUND:
@@ -248,6 +271,21 @@ class SphereEscher:
 
         # train_step returns (loss, sampled timestep); the timestep is diagnostic only.
         loss, timestep = self.guidance.train_step(composited, self.text_embeds)
+
+        # Shape regularizers ride the main backward: their graphs are tiny (points -> areas
+        # and W -> sum of squares), so unlike a second diffusion pass they cost no VRAM.
+        # W_REGULARIZATION mirrors main.py line 615; the equal-area term is the spherical
+        # guard against the measured perimeter-by-degeneracy failure.
+        reg = 0.0
+        if iteration < a.FREEZE_SHAPE_AFTER:
+            if a.EQUAL_AREA_WEIGHT > 0:
+                reg = reg + a.EQUAL_AREA_WEIGHT * equal_area_loss(
+                    points, self.faces_t, self.ref_areas
+                )
+            if a.W_REGULARIZATION > 0:
+                reg = reg + a.W_REGULARIZATION * (self.W**2).sum()
+        if torch.is_tensor(reg):
+            loss = loss + reg.to(loss)
 
         # Back-propagate this pass BEFORE building the silhouette graph. Summing the two
         # losses and calling backward once is equivalent mathematically but keeps both
@@ -272,14 +310,24 @@ class SphereEscher:
             sil = float(sil_loss.detach())
             total_loss += sil
 
-        if iteration >= a.FREEZE_SHAPE_AFTER and self.W.grad is not None:
-            self.W.grad.zero_()
+        if iteration >= a.FREEZE_SHAPE_AFTER:
+            # Zeroing the gradient alone is not a freeze: Adam's momentum keeps moving W
+            # for many steps afterwards. Zero the group's learning rate as well.
+            if self.W.grad is not None:
+                self.W.grad.zero_()
+            self.optimizer.param_groups[0]["lr"] = 0.0
 
         self.optimizer.step()
+
+        areas = np.abs(signed_solid_angles(points.detach().cpu().numpy(), self.mesh.faces))
+        area_spread = float(np.percentile(areas, 99) / max(np.percentile(areas, 1), 1e-30))
+
         return {
             "loss": total_loss,
             "silhouette": sil,
+            "area_reg": float(reg.detach()) if torch.is_tensor(reg) else 0.0,
             "boundary_ratio": self.boundary_ratio(points),
+            "area_spread": area_spread,
             "timestep": float(timestep.float().mean()),
             "energy": self.embedder.last_result.energy,
             "solver_iters": (
@@ -310,10 +358,14 @@ class SphereEscher:
         new = not path.exists()
         with open(path, "a", encoding="utf-8") as f:
             if new:
-                f.write("step,loss,silhouette,karcher,boundary_ratio,solver_iters\n")
+                f.write(
+                    "step,loss,silhouette,area_reg,karcher,"
+                    "boundary_ratio,area_spread,solver_iters\n"
+                )
             f.write(
                 f"{iteration},{info['loss']:.4f},{info['silhouette']:.4f},"
-                f"{info['energy']:.6f},{info['boundary_ratio']:.6f},"
+                f"{info['area_reg']:.4f},{info['energy']:.6f},"
+                f"{info['boundary_ratio']:.6f},{info['area_spread']:.2f},"
                 f"{info['solver_iters']}\n"
             )
 
@@ -419,8 +471,10 @@ class SphereEscher:
                 mem = torch.cuda.max_memory_allocated() / 2**30
                 print(
                     f"step {iteration:5d} | loss {info['loss']:9.1f} | "
-                    f"sil {info['silhouette']:8.1f} | karcher {info['energy']:7.4f} | "
+                    f"sil {info['silhouette']:8.1f} | reg {info['area_reg']:8.1f} | "
+                    f"karcher {info['energy']:7.4f} | "
                     f"perim {info['boundary_ratio']:6.4f}x | "
+                    f"spread {info['area_spread']:6.1f} | "
                     f"solver {info['solver_iters']:3d} it | "
                     f"{per_step:5.2f} s/step | {mem:4.1f} GiB",
                     flush=True,
