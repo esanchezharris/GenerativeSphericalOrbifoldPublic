@@ -349,10 +349,24 @@ class SphereEscher:
         plt.close(fig)
 
     # -------------------------------------------------------------------------- loop
-    def run(self) -> None:
+    def run(self, resume_from: str | Path | None = None) -> None:
+        """Optimise. With ``resume_from``, continue an interrupted run in place.
+
+        Long runs are ~1 hour, so losing one to an interruption is expensive; checkpoints
+        were already being written every ``VISUALIZATION_FREQ`` steps but nothing consumed
+        them.
+        """
         a = self.args
+        first_step = 0
+        if resume_from is not None:
+            first_step = self.load_checkpoint(resume_from) + 1
+            print(f"resuming from {resume_from} at step {first_step}")
+            if first_step >= a.N_STEPS:
+                print("checkpoint is already at or past N_STEPS; nothing to do")
+                return
+
         start = time.time()
-        for iteration in range(a.N_STEPS + 1):
+        for iteration in range(first_step, a.N_STEPS + 1):
             info = self.step(iteration)
 
             if iteration % 10 == 0:
@@ -382,8 +396,9 @@ class SphereEscher:
 def main() -> None:
     cli = OmegaConf.from_cli()
     conf_file = cli.pop("CONF_FILE", "configs/sphere.yaml")
+    resume = cli.pop("RESUME", None)
     args = OmegaConf.merge(OmegaConf.load(PATH / conf_file), cli)
-    SphereEscher(args).run()
+    SphereEscher(args).run(resume_from=resume)
 
 
 if __name__ == "__main__":
