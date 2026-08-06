@@ -96,6 +96,30 @@ def test_run_shape_moves_p_logs_iou_and_checkpoints(tmp_path):
     assert torch.allclose(escher.P.detach(), final)
 
 
+def test_run_shape_weights_mode(tmp_path):
+    """The GEM full-mesh path: the mask loss reaches ALL edge weights through the
+    implicit solve. Same driver, same metrics; no fold rejection (weights-mode solves
+    measured fold-free across two orders of weight magnitude -- flips is a tripwire)."""
+    args = tiny_args(tmp_path)
+    args.PARAM_MODE = "weights"
+    args.LR_W = 0.05
+    args.OUTPUT_DIR = str(tmp_path / "wrun")
+
+    result = run_shape(args)
+    out = Path(args.OUTPUT_DIR)
+
+    assert 0.0 < result["iou"] <= 1.0
+    assert result["flips"] == 0
+
+    final = torch.load(out / "checkpoint_000003.pt", weights_only=False)
+    assert "W" in final and not torch.allclose(final["W"], torch.zeros_like(final["W"])), (
+        "the mask gradient must reach the edge weights through the implicit solve"
+    )
+
+    rows = (out / "metrics.csv").read_text(encoding="utf-8").splitlines()
+    assert all(r.split(",")[9] == "0" for r in rows[1:]), "reverts must stay 0"
+
+
 def test_scaled_n_phi():
     assert scaled_n_phi(19, 4) == 19
     assert scaled_n_phi(19, 6) == 13

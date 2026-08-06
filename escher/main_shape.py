@@ -63,7 +63,9 @@ def build_shape_run(args) -> SphereEscher:
     The ``__new__`` construction is the same one ``render_final.load_run`` and the CPU
     tests use; ``__init__`` is skipped, so the seeding it normally does happens here.
     """
-    assert args.PARAM_MODE == "boundary", "the shape phase drives the boundary directly"
+    # Boundary mode drives ~38 outline points directly; weights mode drives ALL edge
+    # weights through the implicit solve -- the GEM full-mesh parameterization, with
+    # far more articulation capacity. Both use the same mask loss and metrics.
     torch.manual_seed(args.SEED)
     np.random.seed(args.SEED)
 
@@ -176,11 +178,16 @@ def shape_step(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, ar
         reg = reg + args.AREA_TAIL_WEIGHT * area_tail_loss(
             points, escher.faces_t, escher.ref_areas, fraction=args.AREA_TAIL_FRACTION
         )
-    reg = reg + escher.boundary_chain_regularizers()
-    if args.BOUNDARY_MARGIN_WEIGHT > 0:
-        reg = reg + args.BOUNDARY_MARGIN_WEIGHT * area_margin_loss(
-            points, escher.faces_t, escher.ref_areas, margin=args.BOUNDARY_MARGIN
-        )
+    if args.PARAM_MODE == "boundary":
+        reg = reg + escher.boundary_chain_regularizers()
+        if args.BOUNDARY_MARGIN_WEIGHT > 0:
+            reg = reg + args.BOUNDARY_MARGIN_WEIGHT * area_margin_loss(
+                points, escher.faces_t, escher.ref_areas, margin=args.BOUNDARY_MARGIN
+            )
+    elif args.W_REGULARIZATION > 0:
+        # The weights-mode priors, mirroring step(): area terms above guard against the
+        # C-series degeneracy, this one against sigmoid saturation.
+        reg = reg + args.W_REGULARIZATION * (escher.W**2).sum()
 
     loss = mask + reg.to(mask)
     loss.backward()
@@ -366,11 +373,15 @@ def sweep(args) -> None:
 def main() -> None:
     cli = OmegaConf.from_cli()
     conf_file = cli.pop("CONF_FILE", "configs/sphere_shape.yaml")
-    args = OmegaConf.merge(
+    # sphere.yaml -> sphere_shape.yaml -> CONF_FILE (if different) -> CLI, so overlays
+    # like sphere_shape_weights.yaml stay small deltas on the shape defaults.
+    layers = [
         OmegaConf.load(PATH / "configs/sphere.yaml"),
-        OmegaConf.load(PATH / conf_file),
-        cli,
-    )
+        OmegaConf.load(PATH / "configs/sphere_shape.yaml"),
+    ]
+    if conf_file != "configs/sphere_shape.yaml":
+        layers.append(OmegaConf.load(PATH / conf_file))
+    args = OmegaConf.merge(*layers, cli)
     if args.SWEEP_K:
         sweep(args)
     else:

@@ -144,11 +144,12 @@ class SphereEscher:
 
     def _init_parameters(self):
         a = self.args
+        # Both modes report reverts (weights mode simply never increments it).
+        self._n_reverts = 0
         if a.PARAM_MODE == "boundary":
             # ~35 points on the free half of the cut, raw (normalised in boundary_b)
             self.P = torch.nn.Parameter(self.b_orb.initial_free_points().clone())
             self._P_good: torch.Tensor | None = self.P.detach().clone()
-            self._n_reverts = 0
             shape_group = {"params": [self.P], "lr": a.LR_BOUNDARY}
         else:
             n_edges = len(self.mesh.edges)
