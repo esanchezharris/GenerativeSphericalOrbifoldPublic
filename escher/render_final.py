@@ -50,7 +50,7 @@ def load_run(checkpoint: Path) -> tuple[SphereEscher, int]:
 def export_mesh(escher: SphereEscher, out_dir: Path) -> None:
     """Write the tiled sphere as OBJ + MTL + texture."""
     with torch.no_grad():
-        points = escher.embedder(escher.edge_weights())
+        points = escher.solve_points()
     sphere = build_tiled_sphere(
         points.to(escher.device).float(), escher.mesh.faces, escher.mesh.uv, escher.tiler
     )
@@ -81,7 +81,7 @@ def export_mesh(escher: SphereEscher, out_dir: Path) -> None:
 
 def render_turntable(escher: SphereEscher, out_dir: Path, n_frames: int = 120) -> None:
     with torch.no_grad():
-        points = escher.embedder(escher.edge_weights())
+        points = escher.solve_points()
         sphere = build_tiled_sphere(
             points.to(escher.device).float(), escher.mesh.faces, escher.mesh.uv, escher.tiler
         )
