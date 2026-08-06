@@ -108,6 +108,8 @@ class SphereEscher:
 
         # Reference state for the equal-area regularizer: the undeformed lune's own
         # per-face solid angles (its faces legitimately differ in size).
+        self._last_info: dict | None = None
+        self._frozen_at: int | None = None
         self.faces_t = torch.as_tensor(self.mesh.faces, dtype=torch.long)
         self.ref_areas = spherical_face_areas(
             torch.as_tensor(self.mesh.points, dtype=torch.float64), self.faces_t
@@ -254,11 +256,36 @@ class SphereEscher:
             self._solo_tiler = SphericalTiler(rotations=np.eye(3)[None], cone_orders=None)
         return self._solo_tiler
 
+    def shape_frozen(self, iteration: int) -> bool:
+        """Whether the shape phase has ended, by step count or by condition.
+
+        Fixed-step freezing assumes trajectories are reproducible; they are not. Two runs
+        with identical settings and seed diverged wildly (perim 1.47 vs 1.08 at step 400)
+        because CUDA nondeterminism compounds chaotically through SDS. So the freeze can
+        also trigger on the *state*: once the perimeter target is reached, or once the
+        spread ceiling is hit, whichever comes first. Latched: once frozen, stays frozen.
+        """
+        if getattr(self, "_frozen_at", None) is not None:
+            return True
+        a = self.args
+        frozen = iteration >= a.FREEZE_SHAPE_AFTER
+        if not frozen and self._last_info is not None:
+            if a.FREEZE_ON_PERIM > 0 and self._last_info["boundary_ratio"] >= a.FREEZE_ON_PERIM:
+                frozen = True
+            if a.FREEZE_ON_SPREAD > 0 and self._last_info["area_spread"] >= a.FREEZE_ON_SPREAD:
+                frozen = True
+        if frozen:
+            self._frozen_at = iteration
+            print(f"shape frozen at step {iteration}", flush=True)
+        return frozen
+
     def step(self, iteration: int) -> dict:
         a = self.args
         self.optimizer.zero_grad()
         if a.CLAMP_TEXTURE:
             self.texture.data.clamp_(0.0, 1.0)
+
+        frozen = self.shape_frozen(iteration)
 
         # Alternate between the two framings. Isolated views give SDS a silhouette to shape
         # the tile outline with; tiled views make the texture read correctly in context.
@@ -281,7 +308,7 @@ class SphereEscher:
         # W_REGULARIZATION mirrors main.py line 615; the equal-area term is the spherical
         # guard against the measured perimeter-by-degeneracy failure.
         reg = 0.0
-        if iteration < a.FREEZE_SHAPE_AFTER:
+        if not frozen:
             if a.EQUAL_AREA_WEIGHT > 0:
                 reg = reg + a.EQUAL_AREA_WEIGHT * equal_area_loss(
                     points, self.faces_t, self.ref_areas
@@ -310,7 +337,7 @@ class SphereEscher:
             a.SILHOUETTE_WEIGHT > 0
             and a.SILHOUETTE_EVERY > 0
             and iteration % a.SILHOUETTE_EVERY == 0
-            and iteration < a.FREEZE_SHAPE_AFTER
+            and not frozen
         )
         if use_silhouette:
             sil_loss = a.SILHOUETTE_WEIGHT * self.silhouette_loss(a.SILHOUETTE_BATCH_SIZE)
@@ -318,7 +345,7 @@ class SphereEscher:
             sil = float(sil_loss.detach())
             total_loss += sil
 
-        if iteration >= a.FREEZE_SHAPE_AFTER:
+        if frozen:
             # Zeroing the gradient alone is not a freeze: Adam's momentum keeps moving W
             # for many steps afterwards. Zero the group's learning rate as well.
             if self.W.grad is not None:
@@ -330,12 +357,17 @@ class SphereEscher:
         areas = np.abs(signed_solid_angles(points.detach().cpu().numpy(), self.mesh.faces))
         area_spread = float(np.percentile(areas, 99) / max(np.percentile(areas, 1), 1e-30))
 
+        self._last_info = {
+            "boundary_ratio": self.boundary_ratio(points),
+            "area_spread": area_spread,
+        }
         return {
             "loss": total_loss,
             "silhouette": sil,
             "area_reg": float(reg.detach()) if torch.is_tensor(reg) else 0.0,
-            "boundary_ratio": self.boundary_ratio(points),
+            "boundary_ratio": self._last_info["boundary_ratio"],
             "area_spread": area_spread,
+            "frozen_at": self._frozen_at,
             "timestep": float(timestep.float().mean()),
             "energy": self.embedder.last_result.energy,
             "solver_iters": (

@@ -108,6 +108,13 @@ WARM_START: true
 # Shape is frozen after this step and only the texture keeps training, which stops
 # late-stage SDS noise from wrecking a good tile outline.
 FREEZE_SHAPE_AFTER: 1200
+# Condition-based freeze (0 = disabled). SDS trajectories are chaotic -- two runs with
+# identical settings and seed diverged to perim 1.47 vs 1.08 by step 400 (CUDA
+# nondeterminism compounds) -- so freezing on the reached STATE beats freezing on a step
+# count: lock the shape once the perimeter target is hit, or once spread hits the ceiling,
+# whichever comes first. Latched.
+FREEZE_ON_PERIM: 0.0
+FREEZE_ON_SPREAD: 0.0
 
 ### output
 OUTPUT_DIR: "output/sphere"
