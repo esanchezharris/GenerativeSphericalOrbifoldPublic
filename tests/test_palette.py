@@ -77,6 +77,26 @@ def test_three_hues_properly_color_every_k(k):
         assert colors[a] != colors[b], f"tiles {a},{b} share a chain and a color"
 
 
+def test_octahedral_tiling_is_three_colorable():
+    """The (2,3,4) kite tiling: 24 tiles, 3-regular adjacency (36 shared chains),
+    properly 3-colored -- the target image's three-hue look scales to full density."""
+    from escher.OTE.tilings_sphere.boundary_explicit_triple import BoundaryExplicitTriple
+
+    orb = BoundaryExplicitTriple.from_resolution((2, 3, 4), n=6)
+    tiler = orb.tiler()
+    pairs = tile_adjacency(tiler, orb.mesh)
+    assert len(pairs) == 36
+    degree = np.zeros(24, dtype=int)
+    for a, b in pairs:
+        degree[a] += 1
+        degree[b] += 1
+    assert (degree == 3).all()
+
+    colors = assign_palette_indices(tiler, orb.mesh, n_colors=3)
+    for a, b in pairs:
+        assert colors[a] != colors[b]
+
+
 def test_tile_color_matrices_draws_from_the_palette():
     orb = BoundaryExplicitDihedral.from_resolution(k=4, n_theta=6, n_phi=5)
     hues = [0.0, 120.0, -120.0]

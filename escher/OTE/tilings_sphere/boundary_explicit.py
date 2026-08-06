@@ -184,6 +184,21 @@ class BoundaryExplicitDihedral:
                 raise AssertionError(role)
         return torch.stack(rows).reshape(-1)
 
+    def anchored_chains(self, p: Tensor) -> list[Tensor]:
+        """The free chains with their pinned anchors, for the spacing/smoothness regs.
+
+        Same contract as :meth:`BoundaryExplicitTriple.anchored_chains`, so the driver
+        stays orbifold-agnostic.
+        """
+        nl = self.n_free_left
+        pole = torch.tensor([0.0, 0.0, 1.0], dtype=p.dtype)
+        mid = torch.tensor([1.0, 0.0, 0.0], dtype=p.dtype)
+        corner = torch.as_tensor(self.mesh.points[self.mesh.bottom_left], dtype=p.dtype)
+        return [
+            torch.cat([pole[None], p[:nl], corner[None]]),
+            torch.cat([corner[None], p[nl:], mid[None]]),
+        ]
+
     def cotan_edge_weights(self) -> np.ndarray:
         r"""Clamped cotangent weights of the base mesh, aligned with ``mesh.edges``.
 

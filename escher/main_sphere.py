@@ -86,11 +86,22 @@ class SphereEscher:
     def _init_geometry(self):
         a = self.args
         if a.PARAM_MODE == "boundary":
-            # Free half of the cut as direct parameters; interior follows a fixed-boundary
-            # solve with uniform weights. See boundary_explicit.py for why.
-            self.b_orb = BoundaryExplicitDihedral.from_resolution(
-                k=a.ORBIFOLD_K, n_theta=a.MESH_N_THETA, n_phi=a.MESH_N_PHI
-            )
+            # Free side of the cut as direct parameters; interior follows a fixed-boundary
+            # cotangent solve. Dihedral (k,2,2) on the lune by default; ORBIFOLD_CONES
+            # (e.g. [2,3,4] -> octahedral, 24 tiles) switches to the kite domain.
+            cones = a.get("ORBIFOLD_CONES", None)
+            if cones:
+                from escher.OTE.tilings_sphere.boundary_explicit_triple import (
+                    BoundaryExplicitTriple,
+                )
+
+                self.b_orb = BoundaryExplicitTriple.from_resolution(
+                    tuple(int(c) for c in cones), n=a.KITE_N
+                )
+            else:
+                self.b_orb = BoundaryExplicitDihedral.from_resolution(
+                    k=a.ORBIFOLD_K, n_theta=a.MESH_N_THETA, n_phi=a.MESH_N_PHI
+                )
             self.mesh = self.b_orb.mesh
             self.tiler = self.b_orb.tiler()
             self.embedder = BoundaryEmbedder(
@@ -114,8 +125,13 @@ class SphereEscher:
                 self.orbifold.initial_guess(),
                 warm_start=a.WARM_START,
             )
+        cones_label = (
+            tuple(a.ORBIFOLD_CONES)
+            if a.get("ORBIFOLD_CONES", None)
+            else (a.ORBIFOLD_K, 2, 2)
+        )
         print(
-            f"orbifold ({a.ORBIFOLD_K},2,2), mode={a.PARAM_MODE}: {self.tiler.order} tiles | "
+            f"orbifold {cones_label}, mode={a.PARAM_MODE}: {self.tiler.order} tiles | "
             f"domain {self.mesh.n_verts} verts, {len(self.mesh.edges)} edges, "
             f"{len(self.mesh.faces)} faces"
         )
@@ -276,16 +292,7 @@ class SphereEscher:
         surface (the curve) instead of fighting the solve.
         """
         p = self.P / self.P.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        nl = self.b_orb.n_free_left
-        pole = torch.tensor([0.0, 0.0, 1.0], dtype=p.dtype)
-        mid = torch.tensor([1.0, 0.0, 0.0], dtype=p.dtype)
-        corner = torch.as_tensor(
-            self.mesh.points[self.mesh.bottom_left], dtype=p.dtype
-        )
-        chains = [
-            torch.cat([pole[None], p[:nl], corner[None]]),      # left cut chain
-            torch.cat([corner[None], p[nl:], mid[None]]),       # left half of the arc
-        ]
+        chains = self.b_orb.anchored_chains(p)
         spacing = p.new_zeros(())
         smooth = p.new_zeros(())
         for c in chains:
@@ -541,7 +548,7 @@ class SphereEscher:
         return boundary_arc_ratio(
             points.detach().cpu().numpy(),
             self.mesh.points,
-            (self.mesh.left, self.mesh.right, self.mesh.bottom),
+            tuple(self.mesh.boundary_chains),
         )
 
     def log_metrics(self, iteration: int, info: dict) -> None:

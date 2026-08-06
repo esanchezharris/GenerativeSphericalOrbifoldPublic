@@ -29,6 +29,11 @@ BOUNDARY_MARGIN_WEIGHT: 50000.0
 ORBIFOLD_K: 4
 MESH_N_THETA: 28      # rings from pole to equator
 MESH_N_PHI: 19        # vertices across the lune; must be ODD (2-fold cone at the midpoint)
+# Three-cone orbifolds (boundary mode only): null keeps the dihedral lune above; a list
+# like [2, 3, 4] switches to the kite fundamental domain -- octahedral, 24 tiles, the
+# figure density of the target image. KITE_N is the subdivision per triangle edge.
+ORBIFOLD_CONES: null
+KITE_N: 20
 
 ### tile shape
 # Edge weights are sigmoid(W) mapped into [r, 1-r] with r = (1 - W_RANGE)/2, matching the
