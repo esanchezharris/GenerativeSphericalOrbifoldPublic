@@ -1,0 +1,25 @@
+# Deterministic shape phase (main_shape.py) -- merged ON TOP of sphere.yaml.
+# No diffusion model is loaded; the outline is driven by a fixed target mask.
+
+# The mask from make_target.py (npy or png; npy is the chosen candidate).
+TARGET_MASK: "assets/targets/gingerbread/target.npy"
+
+# Pyramid MSE starts around ~1e-2 against a fresh misalignment; 1000 puts it on the
+# same order as the chain regularizers while the margin hinge stays 0 in the healthy
+# region. Calibrate from the first run's printed magnitudes, as ever.
+MASK_LOSS_WEIGHT: 1000.0
+MASK_PYRAMID_LEVELS: 5
+
+# Steps are a solve + one raster (no UNet): hundreds of steps run in minutes.
+SHAPE_STEPS: 400
+
+# Same close-up the SDS isolated pass uses; narrower lunes (larger k) fill less frame,
+# so a k sweep may need this shrunk per-k -- check the step-0 overlay first.
+SHAPE_CAMERA_DISTANCE: 1.7
+
+# Non-empty (e.g. [4, 6]) runs one shape fit per k into OUTPUT_DIR_k<k> and picks the
+# winner by IoU among certificate-valid runs.
+SWEEP_K: []
+
+OUTPUT_DIR: "output/sphere_shape"
+VISUALIZATION_FREQ: 25
