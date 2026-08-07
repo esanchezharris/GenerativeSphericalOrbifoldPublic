@@ -20,8 +20,11 @@ Built on **[Generative Escher Meshes](https://github.com/thibaultgroueix/Generat
 (Aigerman &amp; Groueix, SIGGRAPH 2024 — [paper](https://arxiv.org/abs/2309.14564)),
 extended from flat wallpaper tilings to closed spherical surfaces using
 **[Spherical Orbifold Tutte Embeddings](https://github.com/noamaig/spherical_orbifolds)**
-(Aigerman &amp; Lipman, SIGGRAPH 2017). The image above right is the project's original
-2024 concept; the others are actual outputs of this code.
+(Aigerman &amp; Lipman, SIGGRAPH 2017). The leftmost image above is the project's
+original 2024 concept; the other three are actual outputs of this code — two spheres
+(the dihedral and octahedral orbifolds, tile outlines carved by full-mesh deformation
+through the differentiable Karcher solve) and a planar torus tiling from the same
+mechanism, which also runs the original planar pipeline.
 
 ## How it works
 
