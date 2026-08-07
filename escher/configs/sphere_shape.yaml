@@ -1,0 +1,41 @@
+# Deterministic shape phase (main_shape.py) -- merged ON TOP of sphere.yaml.
+# No diffusion model is loaded; the outline is driven by a fixed target mask.
+
+# The mask from make_target.py (npy or png; npy is the chosen candidate).
+TARGET_MASK: "assets/targets/gingerbread/target.npy"
+# The tile's area is PINNED (the tiling must cover 4pi, so each tile owns 4pi/|G|); a
+# smaller aligned target caps IoU at target_area/tile_area structurally. Area-matched
+# alignment lifts the cap (measured: the free-scale planar carve converged to exactly
+# its area ratio, 0.71).
+MATCH_TILE_AREA: true
+
+# Calibrated by grid at the fixed framing (120-step probes, ~20 s each): weight 5000
+# with softened chain regs climbs IoU 0.695 -> 0.75 and perim to ~1.18 with ZERO folds
+# and zero reverts; 1000 barely moves, 10000 gains nothing and starts reverting. The
+# chain weights below override sphere.yaml's SDS-noise-calibrated values: against a
+# deterministic, smooth target the damping is mostly redundant.
+MASK_LOSS_WEIGHT: 5000.0
+MASK_PYRAMID_LEVELS: 7
+# Soft-edge width of the analytic silhouette, in pixels. Gradients live in this band;
+# the pyramid extends their reach (7 levels: 512 -> 8).
+MASK_TAU: 3.0
+BOUNDARY_SMOOTH_WEIGHT: 300.0
+BOUNDARY_SPACING_WEIGHT: 1000.0
+LR_BOUNDARY: 0.01
+
+# Steps are a solve + one raster (no UNet): hundreds of steps run in minutes.
+SHAPE_STEPS: 400
+
+# NOT the SDS isolated distance (1.7): there the tile fills the frame, which is good
+# for SDS and fatal for mask matching -- the aligned figure blows up into a frame-
+# filling blob (measured: alignment scale 2.0, IoU 0.876 vs a blob, near-flat loss).
+# The tile must sit INSIDE the frame with margins so the figure's limbs stay visible
+# and the residual bumps give the boundary something to chase.
+SHAPE_CAMERA_DISTANCE: 2.8
+
+# Non-empty (e.g. [4, 6]) runs one shape fit per k into OUTPUT_DIR_k<k> and picks the
+# winner by IoU among certificate-valid runs.
+SWEEP_K: []
+
+OUTPUT_DIR: "output/sphere_shape"
+VISUALIZATION_FREQ: 25

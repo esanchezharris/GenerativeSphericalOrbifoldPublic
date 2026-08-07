@@ -1,0 +1,42 @@
+# Texture phase (main_sphere.py) -- merged ON TOP of sphere.yaml, resumed from a shape-
+# phase checkpoint:
+#
+#   python escher/main_sphere.py CONF_FILE=configs/sphere_texture.yaml \
+#       RESUME=output/sphere_shape_k4/checkpoint.pt OUTPUT_DIR=output/sphere_tex
+#
+# The outline is already the figure (deterministic shape phase), so this run is
+# texture-only: shape frozen from step 0, silhouette pass off.
+
+PROMPT: "a cute gingerbread man with white icing and candy buttons, flat vector illustration, solid pastel colors, simple shapes, a masterpiece"
+NEGATIVE_PROMPT: "noisy, grainy, photorealistic, 3d render, blurry, cluttered background, knitted, yarn, fabric, woven texture"
+
+# Style: the first run converged to a "knitted candy" surface. Three levers against it,
+# jointly: the negative prompt above, a lower guidance scale (50 drove saturation), and
+# a gentle TV prior on the texture.
+GUIDANCE_SCALE: 30.0
+TEXTURE_TV_WEIGHT: 100.0
+
+# Fill: the isolated passes previously filled the frame with the tile's INTERIOR, so
+# the model painted a small figure inside it. Now that the outline IS the figure, show
+# the whole cookie-shaped tile with margins and the model completes it edge to edge.
+# (Whole-tile distance depends on tile size; check the first snapshot per orbifold.)
+ISOLATED_DISTANCE: 2.4
+
+# Frozen from the first step; shape_frozen() latches immediately and its guard also
+# disables the silhouette pass. SILHOUETTE_WEIGHT 0 anyway for explicitness.
+FREEZE_SHAPE_AFTER: 0
+SILHOUETTE_WEIGHT: 0.0
+
+# Flat gingerbread tan, not gray/noise: the figure's base coat is already on. The
+# resume flag keeps this init instead of the shape checkpoint's untrained gray.
+TEXTURE_INIT_COLOR: [0.76, 0.60, 0.42]
+RESET_TEXTURE_ON_RESUME: true
+
+# Compose early, polish late (see sphere.yaml).
+SDS_ANNEAL_END: 800
+N_STEPS: 1000
+
+# Wide snapshot panels show the deliverable's alternating-hue look.
+TILE_TINT: true
+
+OUTPUT_DIR: "output/sphere_tex"

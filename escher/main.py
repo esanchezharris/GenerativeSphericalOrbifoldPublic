@@ -62,13 +62,22 @@ start_time = time.time()
 PATH = Path(__file__).parent.absolute()
 
 
+def load_planar_args(cli=None):
+    """``base.yaml`` always loads first; ``CONF_FILE`` (if given) is an OVERLAY on it,
+    and the CLI wins -- mirroring ``main_sphere.main()``. Previously ``CONF_FILE``
+    REPLACED the base config, so a phase overlay silently dropped every default it did
+    not restate."""
+    cli = OmegaConf.from_cli() if cli is None else cli
+    conf_file = cli.get("CONF_FILE", "configs/base.yaml")
+    layers = [OmegaConf.load(PATH / "configs/base.yaml")]
+    if conf_file != "configs/base.yaml":
+        layers.append(OmegaConf.load(PATH / f"{conf_file}"))
+    return OmegaConf.merge(*layers, cli)
+
+
 class Escher:
-    def __init__(self) -> None:
-        # args = parser.parse_args()
-        cli_conf = OmegaConf.from_cli()
-        conf_file = cli_conf.get("CONF_FILE", "configs/base.yaml")
-        base_conf = OmegaConf.load(PATH / f"{conf_file}")
-        args = OmegaConf.merge(base_conf, cli_conf)
+    def __init__(self, args=None) -> None:
+        args = load_planar_args() if args is None else args
         seed_everything(args.SEED)
 
         os.makedirs(args.OUTPUT_DIR, exist_ok=True)
@@ -326,6 +335,21 @@ class Escher:
         # specify trainable parameter in pytorch -> in this case we want to specify theta
         # a scalar multiple of the edges (i,j)
         W = torch.nn.Parameter(torch.randn((edge_pairs.shape[0], 1)))
+        # Cross-phase resume: take the SHAPE from a deterministic shape-phase checkpoint
+        # (only W -- the shape phase trains no texture, so this run's fresh texture init
+        # stands; the spherical RESET_TEXTURE_ON_RESUME lesson applied planar-side).
+        init_path = self.args.get("W_INIT_PATH", None)
+        if init_path:
+            state = torch.load(init_path, map_location="cpu", weights_only=False)
+            if state["W"].shape != W.shape:
+                raise ValueError(
+                    f"W_INIT_PATH {init_path} has W {tuple(state['W'].shape)} but this "
+                    f"mesh/tiling needs {tuple(W.shape)} -- TILING_TYPE/MESH_RESOLUTION "
+                    "must match the shape run"
+                )
+            with torch.no_grad():
+                W.copy_(state["W"])
+            print(f"W initialized from {init_path} (step {state.get('iteration', '?')})")
         self.faces_split = [
             torch.from_numpy(faces_split_).to(self.device).type(torch.int32) for faces_split_ in faces_split
         ]
@@ -347,6 +371,19 @@ class Escher:
         self.sides = sides
         self.edge_pairs = edge_pairs
 
+    def map_weights(self):
+        """``(n_edges, 1)`` solver input in ``[r, 1-r]``, ``r = (1 - W_RANGE)/2``.
+
+        Extracted verbatim from the run loop so the deterministic planar shape phase
+        produces byte-identical solver inputs (and its checkpoints transfer exactly).
+        """
+        if self.args.SIGMOID_WEIGHTS:
+            w = torch.special.expit(self.W)
+        else:
+            self.W.data = self.W.data.clip(0, 1)
+            w = self.W
+        return w * self.args.W_RANGE + (1 - self.args.W_RANGE) / 2
+
     def init_optimizer(self):
         # ================== Init Texture ===========================
         texture = None
@@ -354,9 +391,19 @@ class Escher:
 
         if self.args.OPTIMISE_TEXTURE_MAP:
             texture_map_resolution = max(1024, 512 * len(self.args.PROMPT))
-            self.color_parameters = torch.nn.Parameter(
-                torch.rand(1, texture_map_resolution, texture_map_resolution, self.num_channels).to(self.device)
-            )
+            init_color = self.args.get("TEXTURE_INIT_COLOR", None)
+            if init_color is None:
+                init = torch.rand(1, texture_map_resolution, texture_map_resolution, self.num_channels)
+            else:
+                # Flat start (e.g. gingerbread tan) instead of noise: SDS spends its
+                # budget on the figure, not on fighting out of static. Used raw under
+                # CLAMP_TEXTURE (no sigmoid), same as the spherical pipeline.
+                init = (
+                    torch.tensor([float(c) for c in init_color])
+                    .reshape(1, 1, 1, self.num_channels)
+                    .repeat(1, texture_map_resolution, texture_map_resolution, 1)
+                )
+            self.color_parameters = torch.nn.Parameter(init.to(self.device))
         else:
             self.color_parameters = torch.nn.Parameter(torch.rand(self.W.shape[0], self.num_channels))
 
@@ -388,7 +435,7 @@ class Escher:
         if remaining_steps is None:
             remaining_steps = self.args.N_STEPS
         if self.args.SCHEDULER == "cosine":
-            self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, 100, int(self.self.args.N_STEPS * 1.5))
+            self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, 100, int(self.args.N_STEPS * 1.5))
         elif self.args.SCHEDULER == "linear":
             self.scheduler = get_linear_schedule_with_warmup(self.optimizer, 100)
         elif self.args.SCHEDULER == "step":
@@ -475,7 +522,16 @@ class Escher:
         pbar = tqdm(total=self.args.N_STEPS, desc="steps", position=0)
 
         # ================== Main training loop ===========================
+        mapped = None  # set by the shape branch, or by the freeze block at iter 0
         for iter in range(self.args.N_STEPS):
+            # Arm the SDS grad-clip schedule + timestep anneal (guidance/schedule.py).
+            # update_step was never called here, so CLIP_GRADIENTS_IN_SDS was silently
+            # a no-op in every upstream planar run.
+            if hasattr(self, "guidance_model"):
+                from escher.guidance.schedule import arm_sds
+
+                arm_sds(self.guidance_model, self.args, iter)
+
             if iter == self.args.ONLY_TEXTURE_FROM_THIS_POINT:
                 self.optimizer = torch.optim.Adam(
                     [
@@ -484,6 +540,20 @@ class Escher:
                     lr=self.args.LR,
                 )
                 self.init_scheduler(remaining_steps=self.args.N_STEPS - iter)
+                if mapped is None:
+                    # Freeze from step 0 (the texture phase on a W_INIT_PATH shape):
+                    # nothing has been solved yet -- previously a NameError. One
+                    # no-grad solve pins the geometry for the whole run.
+                    with torch.no_grad():
+                        mapped, _, _ = self.solver.solve(self.map_weights())
+                    mapped = mapped.cuda().float()
+                    if self.args.SYMMETRY_EXPERIMENT:
+                        symmetry_maps = self.constraint_data.get_symmetry_map(
+                            vertices=mapped, sides=self.constraint_data.sides
+                        )
+                        mapped = torch.cat([m.map(mapped[:, 0:2]) for m in symmetry_maps], dim=0)
+                    mapped_noglobaltransform = mapped
+                    global_A = torch.eye(2).cuda()
                 mapped = mapped.clone().detach().requires_grad_(False)
 
             if iter < self.args.ONLY_TEXTURE_FROM_THIS_POINT:
@@ -491,15 +561,8 @@ class Escher:
                     self.color_parameters.data = self.color_parameters.data.clip(0, 1)
 
                 self.optimizer.zero_grad()
-                # weights are positive and smaller than 1
-                if self.args.SIGMOID_WEIGHTS:
-                    # self.W.data = self.W.data.clip(-10, 10) #after 10 we're praxtically at 1 for sigmoid This is killing gradients
-                    w = torch.special.expit(self.W)
-                else:
-                    self.W.data = self.W.data.clip(0, 1)
-                    w = self.W
-                w_solver_input = w * self.args.W_RANGE + (1 - self.args.W_RANGE) / 2
-                # [0,1] ----> [r, 1-r] where r = (1-W_RANGE)/2
+                # weights are positive and smaller than 1: [0,1] -> [r, 1-r]
+                w_solver_input = self.map_weights()
 
                 # ======Solve linear solve ==========================================================
                 mapped, _, success = self.solver.solve(w_solver_input)
@@ -797,10 +860,15 @@ class Escher:
                     self.uv[0, ...].cpu().detach().numpy(),
                     texture_image=texture_img,  # (H, W, C)
                 )
-                render_from_path(
-                    os.path.join(self.args.OUTPUT_DIR, f"final_mesh.obj"),
-                    os.path.join(self.args.OUTPUT_DIR, f"material_0.png"),
-                )
+                try:
+                    render_from_path(
+                        os.path.join(self.args.OUTPUT_DIR, f"final_mesh.obj"),
+                        os.path.join(self.args.OUTPUT_DIR, f"material_0.png"),
+                    )
+                except AttributeError as exc:
+                    # newer libigl builds dropped igl.read_obj; this re-render of the
+                    # just-saved OBJ is a nicety, not a dependency -- keep training.
+                    print(f"render_from_path skipped: {exc}")
                 # pickle everything i need to reproduce these visualizations later, int OUTPUT DIR
 
         if make_videos:

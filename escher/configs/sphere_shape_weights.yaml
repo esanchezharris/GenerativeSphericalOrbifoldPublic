@@ -1,0 +1,27 @@
+# Full-mesh WEIGHTS-mode shape phase -- overlay on sphere.yaml + sphere_shape.yaml.
+# All ~1500 edge weights through the implicit Karcher solve (the GEM parameterization,
+# measured fold-free across two orders of weight magnitude) driven by the deterministic
+# mask loss. The weights mode never had a working shape signal before this (the SDS
+# silhouette pass measured exactly-zero vertex gradients).
+
+PARAM_MODE: "weights"
+
+# null = dihedral lune (the A/B baseline); [2, 3, 4] = octahedral kite, 24 tiles
+# (needs the OctahedralOrbifold weights-mode constraint system).
+ORBIFOLD_CONES: null
+SHAPE_CAMERA_DISTANCE: 2.8    # lune framing; 2.4 for the kite
+
+LR_W: 0.03
+W_RANGE: 0.95
+MASK_LOSS_WEIGHT: 5000.0      # boundary-mode calibration as the prior; probe-recalibrate
+
+# The C-series-safe split barrier: gentle mean + strong tail. Guards the known escape
+# route (perimeter bought by collapsing faces) -- watch area_spread; abort > ~50.
+EQUAL_AREA_WEIGHT: 500.0
+AREA_TAIL_WEIGHT: 800.0
+AREA_TAIL_FRACTION: 0.05
+W_REGULARIZATION: 0.02        # anti-sigmoid-saturation prior
+
+SHAPE_STEPS: 600              # weights move slower than direct boundary points
+SWEEP_K: []
+OUTPUT_DIR: "output/sphere_shape_weights"
