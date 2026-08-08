@@ -1,0 +1,48 @@
+# Batch spec for python -m escher.pipeline -- production values from the README
+# recipe. Copy, edit the jobs list, run overnight:
+#
+#   python -m escher.pipeline escher/configs/batch_example.yaml
+#
+# Every job expands (optionally over a sweep grid) into runs/<batch>/<job>/ with
+# stages target -> screen -> carve_s* -> texture_s* -> render_s*, a manifest,
+# summary.csv, and a contact sheet. CPU screens/carves of job N+1 overlap job N's
+# exclusive GPU texture run.
+
+batch_name: example_overnight
+runs_root: runs
+
+defaults:
+  orbifold: [2, 3, 4]
+  seeds: [0]          # carve seeds; best picked by hard IoU
+  texture_seeds: [0]  # >1 = full texture per seed (hours each) rendered side by side
+  stages:
+    target:
+      N: 16
+      STEPS: 30
+    screen:
+      CONF_FILE: [configs/sphere_shape_weights.yaml]
+      COTANGENT_RELATIVE_WEIGHTS: true
+      SHAPE_CAMERA_DISTANCE: 2.4
+      TARGET_SWEEP_STEPS: 150
+      SWEEP_RANK_METRIC: "hard"
+    carve:
+      CONF_FILE: [configs/sphere_shape_weights.yaml]
+      COTANGENT_RELATIVE_WEIGHTS: true
+      SHAPE_CAMERA_DISTANCE: 2.4
+      SHAPE_STEPS: 1500
+      KEEP_CHECKPOINTS: 2
+    texture:
+      CONF_FILE: [configs/sphere_texture.yaml, configs/sphere_texture_octa.yaml]
+      COTANGENT_RELATIVE_WEIGHTS: true
+      TORCH_COMPILE: true   # measured ~18% faster + 1.6 GiB VRAM headroom
+      KEEP_CHECKPOINTS: 5
+    render:
+      TINT: true
+
+jobs:
+  - figure: fish
+    prompt: "a fish with scales and fins, flat vector illustration, solid pastel colors, simple shapes, a masterpiece"
+    silhouette_prompt: "a plain solid black silhouette of a fish with rounded fins and a broad tail, white background, minimal flat logo, centered, full body"
+
+  - figure: bird
+    prompt: "a song bird with folded wings, flat vector illustration, solid pastel colors, simple shapes, a masterpiece"
