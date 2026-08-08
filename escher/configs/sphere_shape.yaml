@@ -93,6 +93,10 @@ TARGET_AREA_MAX: 0.6
 # Candidate screens are independent solves; 0 = min(8, cores-2). Each worker pins itself
 # to one BLAS thread so the processes do not oversubscribe the machine.
 TARGET_SWEEP_WORKERS: 0
+# Device for the candidate carves. null = inherit DEVICE (historical: cuda -- each
+# worker owns a CUDA context; the soft mask is ~13x faster on GPU). Set "cpu" when
+# a texture run holds the GPU (the batch driver does this to overlap lanes).
+TARGET_SWEEP_DEVICE: null
 # Winner selection for sweeps. "soft" = historical (soft IoU, higher-perimeter
 # tiebreak). "hard" = hard IoU (the filler-relevant, tau-free number) with a
 # LOWER-perimeter tiebreak; soft IoU's tau band penalizes articulated outlines by

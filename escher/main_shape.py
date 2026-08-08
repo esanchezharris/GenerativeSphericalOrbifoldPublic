@@ -659,12 +659,13 @@ def sweep_targets(args) -> dict | None:
                     "SHAPE_STEPS": int(args.TARGET_SWEEP_STEPS),
                     "SWEEP_TARGETS": False,
                     "SWEEP_K": [],
-                    # The screen is CPU work by design, but sphere_shape*.yaml
-                    # inherit DEVICE cuda from sphere.yaml -- measured: up to 8
-                    # spawned workers each building its own CUDA context (and
-                    # firing nvdiffrast snapshot renders) on the "CPU-parallel"
-                    # stage. Screens carry no GPU-worthy work; pin them to CPU.
-                    "DEVICE": "cpu",
+                    # Where candidate carves run. Historically they inherited
+                    # DEVICE=cuda from sphere.yaml -- 8 spawned workers each with
+                    # its own CUDA context, which is fast (the soft mask is ~13x
+                    # faster on GPU) but collides with any concurrent texture run.
+                    # null = inherit (historical); the batch driver passes "cpu"
+                    # so screens can overlap the GPU lane.
+                    "DEVICE": str(args.get("TARGET_SWEEP_DEVICE") or args.DEVICE),
                 },
             ),
             resolve=True,
