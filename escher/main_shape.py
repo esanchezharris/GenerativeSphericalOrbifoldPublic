@@ -495,11 +495,13 @@ def run_shape(args) -> dict:
             save_shape_snapshot(escher, target, ctx, iteration)
             escher.save_checkpoint(iteration)
 
-    escher.save_checkpoint(int(args.SHAPE_STEPS))
-    # Post-step eval: the loop's last info is one Adam step stale relative to the
-    # checkpoint just saved. Log it as the LAST row so last-row consumers see the
-    # checkpoint-accurate numbers, and return/rank on it.
+    # Post-step eval BEFORE the final checkpoint write: the last optimizer.step()
+    # has never been validity-checked, and evaluate_shape's ensure_valid_shape may
+    # project a folded boundary state back onto the valid set (mutating P). Saving
+    # first could persist the folded shape while every reported metric -- and the
+    # "valid" flag the batch driver trusts -- described the reverted one.
     final = evaluate_shape(escher, target, ctx, args)
+    escher.save_checkpoint(int(args.SHAPE_STEPS))
     final_row = {**info, **final, "loss": final["mask"] + info["area_reg"]}
     log_shape_metrics(escher.output_dir, int(args.SHAPE_STEPS), final_row)
     ok, message = escher.check_geometry(final["points"])
