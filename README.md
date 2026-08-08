@@ -72,49 +72,86 @@ This reproduces the fish sphere above end to end (~70 min, most of it step 4):
 python escher/make_target.py OUT_DIR=assets/targets/fish N=64 \
     PROMPT="a plain solid black silhouette of a fish with rounded fins and a broad tail, white background, minimal flat logo, centered, full body"
 
-# 2. screen them by REACHABILITY and keep the best (CPU, parallel, ~4 min for 64)
-python escher/main_shape.py CONF_FILE=configs/sphere_shape_weights.yaml \
-    "ORBIFOLD_CONES=[2,3,4]" SHAPE_CAMERA_DISTANCE=2.4 COTANGENT_RELATIVE_WEIGHTS=true \
+# 2. screen them by REACHABILITY and keep the best (parallel; GPU makes each
+#    candidate carve ~13x faster than CPU)
+python escher/main_shape.py CONF_FILE=configs/sphere_shape_weights_fish2.yaml \
     SWEEP_TARGETS=true TARGET_DIR=assets/targets/fish
 
-# 3. carve the tile outline to the winner (CPU, ~2 min)
-python escher/main_shape.py CONF_FILE=configs/sphere_shape_weights.yaml \
-    "ORBIFOLD_CONES=[2,3,4]" SHAPE_CAMERA_DISTANCE=2.4 COTANGENT_RELATIVE_WEIGHTS=true \
-    TARGET_MASK=assets/targets/fish/target.npy SHAPE_STEPS=1500 OUTPUT_DIR=output/fish_shape
+# 3. carve the tile outline to the winner (GPU ~2.5 min / CPU ~26 min)
+python escher/main_shape.py CONF_FILE=configs/sphere_shape_weights_fish2.yaml \
+    TARGET_MASK=assets/targets/fish/target.npy OUTPUT_DIR=output/fish_shape
 
-# 4. train the shared texture on the frozen shape (GPU, ~50 min)
+# 4. train the shared texture on the frozen shape (GPU; TORCH_COMPILE=true
+#    measured ~18% faster with 1.6 GiB more VRAM headroom)
 python escher/main_sphere.py \
     "CONF_FILE=[configs/sphere_texture.yaml,configs/sphere_texture_octa.yaml]" \
-    COTANGENT_RELATIVE_WEIGHTS=true RESUME=output/fish_shape/checkpoint.pt \
+    COTANGENT_RELATIVE_WEIGHTS=true TORCH_COMPILE=true \
+    RESUME=output/fish_shape/checkpoint.pt START_STEP=0 \
     PROMPT="a fish with scales and fins, flat vector illustration, solid pastel colors, simple shapes, a masterpiece" \
     OUTPUT_DIR=output/fish_tex
 
-# 5. deliverables: shaded turntable, textured OBJ, contact sheet
+# 5. deliverables: shaded turntable, textured OBJ, contact sheet (the unsampled
+#    60% of texels are gutter-filled at export; GUTTER=0 restores the raw look)
 python escher/render_final.py output/fish_tex/checkpoint.pt TINT=1
+
+# Optional: scrub residual background paint (deterministic, reversible) and
+# measure the zero-background gate
+python escher/texture_polish.py output/fish_tex/checkpoint.pt
+python escher/metrics_background.py output/fish_tex/checkpoint_polished.pt
 
 # Planar (the original wallpaper-group pipeline, same shape mechanism):
 python escher/main_shape_planar.py                          # carve on the torus
 python escher/main.py CONF_FILE=configs/planar_texture.yaml # GEM-style joint SDS
 ```
 
+### Batch mode
+
+The whole chain also runs unattended over many figures, seeds, and orbifold
+sweeps — a two-lane scheduler overlaps CPU shape work with the exclusive GPU
+texture runs, every stage runs in its own process with typed exit codes, and a
+manifest + contact sheet record the night:
+
+```bash
+python -m escher.pipeline escher/configs/batch_example.yaml          # real batch
+python -m escher.pipeline escher/configs/batch_smoke.yaml --dry-run  # <1 min check
+```
+
 Configs live in `escher/configs/` (`sphere.yaml` base; `sphere_shape.yaml`,
-`sphere_shape_weights.yaml`, `sphere_texture.yaml`, `planar_shape.yaml`,
-`planar_texture.yaml` phase overlays). The test suite (`pytest tests/`, 270+ tests)
-runs entirely on CPU, including both shape-phase optimizations end to end.
+`sphere_shape_weights_fish2.yaml` (the A/B-winning carve recipe),
+`sphere_texture.yaml`, `sphere_texture_octa_nobg.yaml` (zero-background levers),
+`planar_shape.yaml`, `planar_texture.yaml` phase overlays). The test suite
+(`pytest tests/`, 300+ tests) runs entirely on CPU, including both shape-phase
+optimizations and the batch driver end to end.
 
 ## Results
 
-Soft IoU of the tile silhouette against the area-matched target mask; perimeter relative
-to the undeformed tile. All on `(2,3,4)`, 24 tiles, unless noted.
+Hard IoU (both masks thresholded at 0.5 — the number that corresponds to filler
+on the sphere; the soft metric a perfect carve can only score ~0.93 on is gone
+from the headline) of the tile silhouette against the area-matched target;
+perimeter relative to the undeformed tile. All on `(2,3,4)`, 24 tiles, fish64
+target, 1500 steps, unless noted.
 
-| Run | IoU | Perimeter | Certificate |
-|---|---|---|---|
-| **Fish** (`output/texF_fish`) | **0.814** | 1.200× | 4π at 2.3e-13, 0 folds |
-| Gingerbread man | 0.737 | 1.442× | 4π at 1.2e-13, 0 folds |
-| Sphere `(4,2,2)`, 8 tiles | 0.798 | 1.444× | 4π at 0.0e+00, 0 folds |
-| Plane, torus | 0.751 | — | fold-free (planar Tutte guarantee) |
+| Run | hard IoU | sr-weighted | Perimeter | Certificate |
+|---|---|---|---|---|
+| Shipped carve (`output/texF_fish`) | 0.824 | 0.797 | 1.200× | 4π at 2.3e-13, 0 folds |
+| + achieved-area crop fix (unconditional) | 0.835 | 0.797 | 1.184× | 0 folds |
+| **+ corner/translation alignment + tau anneal** | **0.868** | **0.839** | 1.196× | 0 folds |
+| Gingerbread man (soft 0.737, historical) | — | — | 1.442× | 4π at 1.2e-13, 0 folds |
+| Plane, torus (soft 0.751, historical) | — | — | — | fold-free (planar Tutte) |
 
-Four things moved the needle, in the order we found them:
+Background on the rendered sphere (`metrics_background.py`, 30 tinted orbit
+views): the shipped fish read **1.91%** background-like; the polish scrub +
+gutter fill take the same checkpoint to **0.27%** with structurally zero
+background texels — no retraining.
+
+Texture-phase speed on the current machine: 0.54 → 0.42 s/step (~22%), and peak
+VRAM 9.1 → 7.5 GiB, from the frozen-solve cache + cached rasterizer context +
+`TORCH_COMPILE=true`.
+
+Four things moved the needle originally, in the order we found them (the carve
+gains above came later, from measurement: the alignment POSE dominates —
+scoring it by where the four immovable cone corners land, and searching
+translation, was worth more than any framing or area-measure change we tried):
 
 **The step budget.** Score distillation needs the full 7000-step schedule. At 1400 the
 texture is coloured stipple; the same run at 7000 resolves into clean icing, scales and
@@ -178,8 +215,14 @@ move together.
   `escher/main.py` / `escher/render_final.py` — the pipeline stages, sphere and plane.
 - `escher/rendering/palette.py` — the per-tile hue rotation and the tiling adjacency
   3-coloring.
-- `lbfgs-translation/` — the original MATLAB→Python solver port that seeded the
-  project (superseded by `escher/OTE/core/spherical/`).
+- `escher/rendering/texture_mask.py` / `escher/texture_polish.py` /
+  `escher/metrics_background.py` — the zero-background toolkit: UV gutter fill
+  for the ~60% of texels no triangle samples, the deterministic background
+  scrub, and the render gate that measures them.
+- `escher/pipeline/` — the unattended batch driver (spec → two-lane scheduler →
+  manifest + contact sheet).
+- `escher/pixel_solid_angle.py` — per-pixel spherical area of the shape camera
+  (pixel counts are not steradians; the area matching now knows).
 
 ## Attribution
 
