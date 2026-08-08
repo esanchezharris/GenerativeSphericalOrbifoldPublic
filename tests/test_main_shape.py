@@ -77,8 +77,11 @@ def test_run_shape_moves_p_logs_iou_and_checkpoints(tmp_path):
 
     header = (out / "metrics.csv").read_text(encoding="utf-8").splitlines()[0]
     assert header.split(",")[3] == "iou"
+    # hard_iou is appended LAST so the positional parses above stay valid.
+    assert header.split(",")[-1] == "hard_iou"
     assert result["k"] == args.ORBIFOLD_K
     assert 0.0 < result["iou"] <= 1.0
+    assert 0.0 < result["hard_iou"] <= 1.0
 
     # the optimizer must actually have moved the boundary
     escher = build_shape_run(args)

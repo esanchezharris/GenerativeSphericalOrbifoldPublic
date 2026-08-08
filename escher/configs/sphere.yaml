@@ -177,3 +177,7 @@ PALETTE_HUES_DEG: [0.0, 120.0, -120.0]
 OUTPUT_DIR: "output/sphere"
 VISUALIZATION_FREQ: 50
 DEVICE: "cuda"
+# Per-phase timing breakdown (escher/misc/timing.py) -> timing.csv beside metrics.csv.
+# Inserts cuda synchronize at phase boundaries, which itself slows the loop -- enable
+# only when measuring, never for production runs.
+TIMING: false

@@ -49,6 +49,7 @@ from escher.geometry.spherical_sanity_checks import (
     count_flipped_faces,
     signed_solid_angles,
 )
+from escher.misc.timing import PhaseTimer
 from escher.rendering.camera import orbit_views, tile_centric_views
 from escher.rendering.render_sphere_nvdiffrast import build_tiled_sphere, render_tiled_sphere
 
@@ -536,7 +537,8 @@ class SphereEscher:
         frozen = self.shape_frozen(iteration)
 
         # Validity projection BEFORE anything uses this step's geometry.
-        _, flips, reverted = self.ensure_valid_shape()
+        with self.timer.phase("solve"):
+            _, flips, reverted = self.ensure_valid_shape()
         if reverted:
             self._n_reverts += 1
             self.reset_shape_optimizer_state()
@@ -546,7 +548,8 @@ class SphereEscher:
         # The fraction sets the actual cadence (0.5 -> every 2nd step), not just on/off.
         frac = a.ISOLATED_TILE_FRACTION
         isolated = frac > 0 and iteration % max(1, round(1.0 / frac)) == 0
-        images, alpha, points = self.render(a.IMAGE_BATCH_SIZE, isolated=isolated)
+        with self.timer.phase("render"):
+            images, alpha, points = self.render(a.IMAGE_BATCH_SIZE, isolated=isolated)
 
         if a.RANDOM_BACKGROUND:
             bg = torch.rand(images.shape[0], 1, 1, 3, device=self.device)
@@ -555,7 +558,8 @@ class SphereEscher:
         composited = images * alpha + bg * (1.0 - alpha)
 
         # train_step returns (loss, sampled timestep); the timestep is diagnostic only.
-        loss, timestep = self.guidance.train_step(composited, self.text_embeds)
+        with self.timer.phase("sds"):
+            loss, timestep = self.guidance.train_step(composited, self.text_embeds)
 
         # Shape regularizers ride the main backward: their graphs are tiny (points -> areas
         # and W -> sum of squares), so unlike a second diffusion pass they cost no VRAM.
@@ -594,7 +598,8 @@ class SphereEscher:
         # the step rate collapsed from 0.54 to over 2.3 s. Separate backwards accumulate
         # into the same .grad buffers, so the result is identical and the first graph is
         # freed before the second is built.
-        loss.backward()
+        with self.timer.phase("backward"):
+            loss.backward()
         total_loss = float(loss.detach())
 
         sil = 0.0
@@ -605,23 +610,33 @@ class SphereEscher:
             and not frozen
         )
         if use_silhouette:
-            sil_loss = a.SILHOUETTE_WEIGHT * self.silhouette_loss(a.SILHOUETTE_BATCH_SIZE)
-            sil_loss.backward()
+            with self.timer.phase("backward"):
+                sil_loss = a.SILHOUETTE_WEIGHT * self.silhouette_loss(
+                    a.SILHOUETTE_BATCH_SIZE
+                )
+                sil_loss.backward()
             sil = float(sil_loss.detach())
             total_loss += sil
 
-        if frozen:
-            self.apply_shape_freeze()
+        with self.timer.phase("opt"):
+            if frozen:
+                self.apply_shape_freeze()
 
-        self.optimizer.step()
+            self.optimizer.step()
 
-        areas = np.abs(signed_solid_angles(points.detach().cpu().numpy(), self.mesh.faces))
-        area_spread = float(np.percentile(areas, 99) / max(np.percentile(areas, 1), 1e-30))
+        with self.timer.phase("stats"):
+            areas = np.abs(
+                signed_solid_angles(points.detach().cpu().numpy(), self.mesh.faces)
+            )
+            area_spread = float(
+                np.percentile(areas, 99) / max(np.percentile(areas, 1), 1e-30)
+            )
 
-        self._last_info = {
-            "boundary_ratio": self.boundary_ratio(points),
-            "area_spread": area_spread,
-        }
+            self._last_info = {
+                "boundary_ratio": self.boundary_ratio(points),
+                "area_spread": area_spread,
+            }
+        self.timer.tick()
         return {
             "loss": total_loss,
             "silhouette": sil,
@@ -641,6 +656,45 @@ class SphereEscher:
         }
 
     # ------------------------------------------------------------------- diagnostics
+    TIMING_PHASES = (
+        "solve",
+        "render",
+        "sds",
+        "backward",
+        "opt",
+        "stats",
+        "geom_check",
+        "snapshot",
+        "checkpoint",
+    )
+
+    @property
+    def timer(self) -> PhaseTimer:
+        """Lazy so the ``__new__``-built paths (shape phase, render_final) get one too."""
+        t = getattr(self, "_timer", None)
+        if t is None:
+            t = PhaseTimer(
+                enabled=bool(self.args.get("TIMING", False)),
+                cuda_sync=self.device.type == "cuda",
+            )
+            self._timer = t
+        return t
+
+    def log_timing(self, iteration: int) -> None:
+        """One row of per-phase mean ms/step over the window since the last row."""
+        path = self.output_dir / "timing.csv"
+        new = not path.exists()
+        means = self.timer.means_ms(self.TIMING_PHASES)
+        with open(path, "a", encoding="utf-8") as f:
+            if new:
+                f.write("step," + ",".join(self.TIMING_PHASES) + ",total_ms\n")
+            f.write(
+                f"{iteration},"
+                + ",".join(f"{m:.1f}" for m in means)
+                + f",{sum(means):.1f}\n"
+            )
+        self.timer.reset()
+
     def boundary_ratio(self, points: torch.Tensor) -> float:
         """Tile perimeter relative to the undeformed lune -- see
         :func:`~escher.geometry.spherical_sanity_checks.boundary_arc_ratio`."""
@@ -792,13 +846,20 @@ class SphereEscher:
                 return
 
         start = time.time()
+        last_print = (start, first_step)
         for iteration in range(first_step, a.N_STEPS + 1):
             info = self.step(iteration)
 
             if iteration % 10 == 0:
                 self.log_metrics(iteration, info)
-                elapsed = time.time() - start
-                per_step = elapsed / max(iteration - first_step, 1)
+                if self.timer.enabled:
+                    self.log_timing(iteration)
+                now = time.time()
+                per_step = (now - start) / max(iteration - first_step, 1)
+                # Instantaneous (since the last print) next to cumulative: the
+                # cumulative average buries a mid-run slowdown for thousands of steps.
+                inst = (now - last_print[0]) / max(iteration - last_print[1], 1)
+                last_print = (now, iteration)
                 mem = torch.cuda.max_memory_allocated() / 2**30
                 print(
                     f"step {iteration:5d} | loss {info['loss']:9.1f} | "
@@ -808,16 +869,19 @@ class SphereEscher:
                     f"spread {info['area_spread']:6.1f} | "
                     f"flp {info['flips']:2d}/{info['reverts']:3d} | "
                     f"solver {info['solver_iters']:3d} it | "
-                    f"{per_step:5.2f} s/step | {mem:4.1f} GiB",
+                    f"{inst:5.2f}/{per_step:5.2f} s/step | {mem:4.1f} GiB",
                     flush=True,
                 )
 
             if iteration % a.VISUALIZATION_FREQ == 0:
-                ok, message = self.check_geometry(info["points"])
+                with self.timer.phase("geom_check"):
+                    ok, message = self.check_geometry(info["points"])
                 if not ok:
                     print(f"  !! geometry check failed: {message}")
-                self.save_snapshot(iteration)
-                self.save_checkpoint(iteration)
+                with self.timer.phase("snapshot"):
+                    self.save_snapshot(iteration)
+                with self.timer.phase("checkpoint"):
+                    self.save_checkpoint(iteration)
 
         self.save_checkpoint(a.N_STEPS)
         print(f"\ndone in {(time.time() - start) / 60:.1f} min -> {self.output_dir}")

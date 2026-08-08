@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from scipy import ndimage
 from torch import Tensor
 
-__all__ = ["binarize_mask", "align_mask_to", "soft_iou", "mask_pyramid_loss"]
+__all__ = ["binarize_mask", "align_mask_to", "soft_iou", "hard_iou", "mask_pyramid_loss"]
 
 
 def _to_grayscale(image: np.ndarray) -> np.ndarray:
@@ -109,11 +109,23 @@ def _moments(mask: np.ndarray) -> tuple[np.ndarray, float]:
     return centroid, float(np.sqrt((w * r2).sum() / total))
 
 
-def _hard_iou(a: np.ndarray, b: np.ndarray) -> float:
-    a = a > 0.5
-    b = b > 0.5
+def hard_iou(a: np.ndarray, b: np.ndarray) -> float:
+    """Binary IoU after thresholding both masks at 0.5.
+
+    This is the number that corresponds to "filler" on the sphere. :func:`soft_iou`
+    compares a sigmoid-softened alpha against a binary target, so a mathematically
+    perfect carve reports ~0.93 at ``MASK_TAU`` 3 -- and the shortfall *grows with
+    perimeter*, biasing any soft-IoU ranking against articulated outlines. With the
+    sigmoid mask, alpha > 0.5 exactly iff the pixel center is inside the polygon, so
+    thresholding removes the tau dependence entirely.
+    """
+    a = np.asarray(a) > 0.5
+    b = np.asarray(b) > 0.5
     union = np.logical_or(a, b).sum()
     return float(np.logical_and(a, b).sum() / max(union, 1))
+
+
+_hard_iou = hard_iou  # internal alias, kept for call sites below
 
 
 def align_mask_to(

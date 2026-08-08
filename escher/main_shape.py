@@ -39,7 +39,13 @@ from omegaconf import OmegaConf
 
 from escher.main_sphere import PATH, SphereEscher
 from escher.rendering.camera import orbit_views, perspective, tile_centric_views
-from escher.shape_target import align_mask_to, binarize_mask, mask_pyramid_loss, soft_iou
+from escher.shape_target import (
+    align_mask_to,
+    binarize_mask,
+    hard_iou,
+    mask_pyramid_loss,
+    soft_iou,
+)
 from escher.soft_silhouette import boundary_loop, project_to_pixels, soft_polygon_mask
 from escher.OTE.core.spherical.regularizers import (
     area_margin_loss,
@@ -227,6 +233,9 @@ def shape_step(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, ar
         "loss": float(loss.detach()),
         "mask": float(mask.detach()),
         "iou": float(soft_iou(alpha.detach(), target)),
+        "hard_iou": hard_iou(
+            alpha.detach()[0, ..., 0].cpu().numpy(), target.detach().cpu().numpy()
+        ),
         "area_reg": float(reg.detach()),
         "boundary_ratio": escher.boundary_ratio(points),
         "area_spread": float(
@@ -243,21 +252,59 @@ def shape_step(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, ar
     }
 
 
+def evaluate_shape(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, args) -> dict:
+    """No-grad metrics of the CURRENT parameters -- exactly what a checkpoint holds.
+
+    ``shape_step`` measures alpha BEFORE its optimizer step, so the loop's last info
+    describes the state one Adam step before the checkpoint saved after it. Ranking a
+    sweep or gating a carve on that stale number is off by one step; this eval is what
+    ``run_shape`` reports and returns.
+    """
+    with torch.no_grad():
+        points, flips, _ = escher.ensure_valid_shape()
+        alpha = soft_alpha(escher, points, ctx)
+        mask = args.MASK_LOSS_WEIGHT * mask_pyramid_loss(
+            alpha, target, levels=args.MASK_PYRAMID_LEVELS
+        )
+    areas = np.abs(signed_solid_angles(points.detach().cpu().numpy(), escher.mesh.faces))
+    return {
+        "mask": float(mask),
+        "iou": float(soft_iou(alpha, target)),
+        "hard_iou": hard_iou(alpha[0, ..., 0].cpu().numpy(), target.cpu().numpy()),
+        "boundary_ratio": escher.boundary_ratio(points),
+        "area_spread": float(
+            np.percentile(areas, 99) / max(np.percentile(areas, 1), 1e-30)
+        ),
+        "flips": flips,
+        "energy": escher.embedder.last_result.energy,
+        "solver_iters": (
+            escher.embedder.last_result.stage1.n_iter
+            + escher.embedder.last_result.stage2.n_iter
+        ),
+        "points": points,
+    }
+
+
 def log_shape_metrics(output_dir: Path, iteration: int, info: dict) -> None:
-    """Own CSV, own header: ``log_metrics``'s header is hardcoded for the SDS loop."""
+    """Own CSV, own header: ``log_metrics``'s header is hardcoded for the SDS loop.
+
+    ``hard_iou`` is appended LAST: tests and downstream parsers index the earlier
+    columns by position.
+    """
     path = output_dir / "metrics.csv"
     new = not path.exists()
     with open(path, "a", encoding="utf-8") as f:
         if new:
             f.write(
                 "step,loss,mask,iou,area_reg,karcher,"
-                "boundary_ratio,area_spread,flips,reverts,solver_iters\n"
+                "boundary_ratio,area_spread,flips,reverts,solver_iters,hard_iou\n"
             )
         f.write(
             f"{iteration},{info['loss']:.4f},{info['mask']:.4f},{info['iou']:.4f},"
             f"{info['area_reg']:.4f},{info['energy']:.6f},"
             f"{info['boundary_ratio']:.6f},{info['area_spread']:.2f},"
-            f"{info['flips']},{info['reverts']},{info['solver_iters']}\n"
+            f"{info['flips']},{info['reverts']},{info['solver_iters']},"
+            f"{info['hard_iou']:.4f}\n"
         )
 
 
@@ -323,6 +370,7 @@ def run_shape(args) -> dict:
             print(
                 f"step {iteration:5d} | loss {info['loss']:9.1f} | "
                 f"mask {info['mask']:8.1f} | iou {info['iou']:.4f} | "
+                f"hard {info['hard_iou']:.4f} | "
                 f"reg {info['area_reg']:8.1f} | "
                 f"perim {info['boundary_ratio']:6.4f}x | "
                 f"spread {info['area_spread']:6.1f} | "
@@ -339,15 +387,26 @@ def run_shape(args) -> dict:
             escher.save_checkpoint(iteration)
 
     escher.save_checkpoint(int(args.SHAPE_STEPS))
-    ok, message = escher.check_geometry(info["points"])
+    # Post-step eval: the loop's last info is one Adam step stale relative to the
+    # checkpoint just saved. Log it as the LAST row so last-row consumers see the
+    # checkpoint-accurate numbers, and return/rank on it.
+    final = evaluate_shape(escher, target, ctx, args)
+    final_row = {**info, **final, "loss": final["mask"] + info["area_reg"]}
+    log_shape_metrics(escher.output_dir, int(args.SHAPE_STEPS), final_row)
+    ok, message = escher.check_geometry(final["points"])
     print(f"final geometry: {message}")
+    print(
+        f"final iou {final['iou']:.4f} (hard {final['hard_iou']:.4f}) | "
+        f"perim {final['boundary_ratio']:.4f}x"
+    )
     print(f"done in {(time.time() - start) / 60:.1f} min -> {escher.output_dir}")
     return {
         "k": int(args.ORBIFOLD_K),
-        "iou": info["iou"],
-        "boundary_ratio": info["boundary_ratio"],
-        "area_spread": info["area_spread"],
-        "flips": info["flips"],
+        "iou": final["iou"],
+        "hard_iou": final["hard_iou"],
+        "boundary_ratio": final["boundary_ratio"],
+        "area_spread": final["area_spread"],
+        "flips": final["flips"],
         "valid": ok,
         "output_dir": str(escher.output_dir),
     }
@@ -381,11 +440,12 @@ def sweep(args) -> None:
         print(f"\n=== k={k} ({2 * int(k)} tiles), n_phi={run_args.MESH_N_PHI} ===")
         results.append(run_shape(run_args))
 
-    lines = ["k,iou,boundary_ratio,area_spread,flips,valid,output_dir"]
+    lines = ["k,iou,boundary_ratio,area_spread,flips,valid,output_dir,hard_iou"]
     for r in results:
         lines.append(
             f"{r['k']},{r['iou']:.4f},{r['boundary_ratio']:.4f},"
-            f"{r['area_spread']:.1f},{r['flips']},{r['valid']},{r['output_dir']}"
+            f"{r['area_spread']:.1f},{r['flips']},{r['valid']},{r['output_dir']},"
+            f"{r['hard_iou']:.4f}"
         )
     sweep_csv = Path(f"{args.OUTPUT_DIR}_sweep.csv")
     sweep_csv.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -492,11 +552,12 @@ def sweep_targets(args) -> None:
         r["target"] = cfg["TARGET_MASK"]
         results.append(r)
 
-    lines = ["target,iou,boundary_ratio,area_spread,flips,valid,output_dir"]
+    lines = ["target,iou,boundary_ratio,area_spread,flips,valid,output_dir,hard_iou"]
     for r in results:
         lines.append(
             f"{Path(r['target']).stem},{r['iou']:.4f},{r['boundary_ratio']:.4f},"
-            f"{r['area_spread']:.1f},{r['flips']},{r['valid']},{r['output_dir']}"
+            f"{r['area_spread']:.1f},{r['flips']},{r['valid']},{r['output_dir']},"
+            f"{r['hard_iou']:.4f}"
         )
     Path(f"{args.OUTPUT_DIR}_targets.csv").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
