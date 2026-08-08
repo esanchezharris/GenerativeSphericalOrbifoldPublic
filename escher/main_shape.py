@@ -105,13 +105,32 @@ def fixed_tile_camera(escher: SphereEscher, args) -> torch.Tensor:
 
 
 def make_context(escher: SphereEscher, args) -> ShapeContext:
+    # The shape phase may use its own framing (SHAPE_RENDER_SIZE / SHAPE_CAMERA_FOV,
+    # null = the render defaults). The production (2,3,4) framing left 4.2 px of
+    # margin -- the PINNED cone corners pressed against the frame edge, and outline
+    # excursions past the edge are invisible to BOTH the loss and the metric.
+    # Widening FOV with a proportionally larger grid adds margin without shrinking
+    # pixels-per-steradian (the "tile too small -> flat mask loss" failure mode).
     return ShapeContext(
         mv=fixed_tile_camera(escher, args),
-        proj=perspective(fovy_deg=float(args.CAMERA_FOV)),
+        proj=perspective(fovy_deg=float(args.get("SHAPE_CAMERA_FOV") or args.CAMERA_FOV)),
         loop=torch.as_tensor(boundary_loop(escher.mesh), dtype=torch.long),
-        size=int(args.RENDER_SIZE),
+        size=int(args.get("SHAPE_RENDER_SIZE") or args.RENDER_SIZE),
         tau=float(args.MASK_TAU),
     )
+
+
+def frame_margin_px(escher: SphereEscher, ctx: ShapeContext) -> float:
+    """Min distance (px) from the UNDEFORMED tile boundary to the frame edge.
+
+    Negative means boundary vertices start OUTSIDE the frame (the shipped
+    sphere_shape_ico framing had 8 of them at margin -17.5 px) -- pixels the carve
+    can neither move nor score.
+    """
+    pts = torch.as_tensor(escher.mesh.points, dtype=torch.float64)
+    with torch.no_grad():
+        px = project_to_pixels(pts[ctx.loop], ctx.mv, ctx.proj, ctx.size, ctx.size)
+    return float(min(px.min(), ctx.size - 1 - px.max()))
 
 
 def soft_alpha(escher: SphereEscher, points: torch.Tensor, ctx: ShapeContext) -> torch.Tensor:
@@ -357,6 +376,22 @@ def save_shape_snapshot(
 def run_shape(args) -> dict:
     escher = build_shape_run(args)
     ctx = make_context(escher, args)
+
+    margin = frame_margin_px(escher, ctx)
+    print(f"frame margin: {margin:.1f} px (undeformed tile on the {ctx.size}px grid)")
+    min_margin = float(args.get("MIN_FRAME_MARGIN_PX", 0.0))
+    if margin < min_margin:
+        raise ValueError(
+            f"undeformed tile margin {margin:.1f} px < MIN_FRAME_MARGIN_PX "
+            f"{min_margin}; widen SHAPE_CAMERA_FOV / SHAPE_RENDER_SIZE or raise "
+            f"SHAPE_CAMERA_DISTANCE"
+        )
+    if margin <= 0:
+        print(
+            "  !! boundary vertices start OUTSIDE the frame -- the loss and metric "
+            "cannot see them; fix the framing before trusting any number from this run"
+        )
+
     target = prepare_target(escher, ctx, args)
 
     start = time.time()

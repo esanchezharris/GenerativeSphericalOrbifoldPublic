@@ -33,6 +33,16 @@ SHAPE_STEPS: 400
 # and the residual bumps give the boundary something to chase.
 SHAPE_CAMERA_DISTANCE: 2.8
 
+# Shape-phase-only framing overrides (null = RENDER_SIZE / CAMERA_FOV). The measured
+# production (2,3,4) framing (d=2.4, fov=40, 512px) leaves 4.2 px of margin: the
+# PINNED cone corners press the frame edge, and outline excursions past the edge are
+# invisible to loss AND metric. Scaling FOV and grid together (e.g. fov 50 @ 640px)
+# adds real margin at unchanged pixels-per-steradian. run_shape prints the achieved
+# margin at step 0; MIN_FRAME_MARGIN_PX > 0 turns a shortfall into a hard error.
+SHAPE_RENDER_SIZE: null
+SHAPE_CAMERA_FOV: null
+MIN_FRAME_MARGIN_PX: 0
+
 # Non-empty (e.g. [4, 6]) runs one shape fit per k into OUTPUT_DIR_k<k> and picks the
 # winner by IoU among certificate-valid runs.
 SWEEP_K: []
