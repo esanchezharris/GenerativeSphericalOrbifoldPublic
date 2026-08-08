@@ -39,7 +39,13 @@ from omegaconf import OmegaConf
 
 from escher.main_sphere import PATH, SphereEscher
 from escher.rendering.camera import orbit_views, perspective, tile_centric_views
-from escher.shape_target import align_mask_to, binarize_mask, mask_pyramid_loss, soft_iou
+from escher.shape_target import (
+    align_mask_to,
+    binarize_mask,
+    hard_iou,
+    mask_pyramid_loss,
+    soft_iou,
+)
 from escher.soft_silhouette import boundary_loop, project_to_pixels, soft_polygon_mask
 from escher.OTE.core.spherical.regularizers import (
     area_margin_loss,
@@ -58,6 +64,8 @@ class ShapeContext:
     loop: torch.Tensor  # ordered boundary vertex indices
     size: int
     tau: float
+    # Per-pixel solid angles for SOLID_ANGLE_LOSS_WEIGHTING; None = unweighted.
+    loss_weights: torch.Tensor | None = None
 
 
 def build_shape_run(args) -> SphereEscher:
@@ -99,13 +107,32 @@ def fixed_tile_camera(escher: SphereEscher, args) -> torch.Tensor:
 
 
 def make_context(escher: SphereEscher, args) -> ShapeContext:
+    # The shape phase may use its own framing (SHAPE_RENDER_SIZE / SHAPE_CAMERA_FOV,
+    # null = the render defaults). The production (2,3,4) framing left 4.2 px of
+    # margin -- the PINNED cone corners pressed against the frame edge, and outline
+    # excursions past the edge are invisible to BOTH the loss and the metric.
+    # Widening FOV with a proportionally larger grid adds margin without shrinking
+    # pixels-per-steradian (the "tile too small -> flat mask loss" failure mode).
     return ShapeContext(
         mv=fixed_tile_camera(escher, args),
-        proj=perspective(fovy_deg=float(args.CAMERA_FOV)),
+        proj=perspective(fovy_deg=float(args.get("SHAPE_CAMERA_FOV") or args.CAMERA_FOV)),
         loop=torch.as_tensor(boundary_loop(escher.mesh), dtype=torch.long),
-        size=int(args.RENDER_SIZE),
+        size=int(args.get("SHAPE_RENDER_SIZE") or args.RENDER_SIZE),
         tau=float(args.MASK_TAU),
     )
+
+
+def frame_margin_px(escher: SphereEscher, ctx: ShapeContext) -> float:
+    """Min distance (px) from the UNDEFORMED tile boundary to the frame edge.
+
+    Negative means boundary vertices start OUTSIDE the frame (the shipped
+    sphere_shape_ico framing had 8 of them at margin -17.5 px) -- pixels the carve
+    can neither move nor score.
+    """
+    pts = torch.as_tensor(escher.mesh.points, dtype=torch.float64)
+    with torch.no_grad():
+        px = project_to_pixels(pts[ctx.loop], ctx.mv, ctx.proj, ctx.size, ctx.size)
+    return float(min(px.min(), ctx.size - 1 - px.max()))
 
 
 def soft_alpha(escher: SphereEscher, points: torch.Tensor, ctx: ShapeContext) -> torch.Tensor:
@@ -148,13 +175,58 @@ def prepare_target(escher: SphereEscher, ctx: ShapeContext, args) -> torch.Tenso
     with torch.no_grad():
         alpha0 = soft_alpha(escher, escher.solve_points(), ctx)[0, ..., 0].cpu().numpy()
 
+    weights = None
+    if bool(args.get("SOLID_ANGLE_AREA_MATCH", False)):
+        from escher.pixel_solid_angle import pixel_solid_angles
+
+        weights = pixel_solid_angles(ctx.mv, ctx.proj, ctx.size, ctx.size)
+
+    # The four PINNED cone corners (kite domains only): outline points the carve can
+    # never move. Projected here for alignment scoring and for the diagnostics below.
+    corner_px = None
+    mesh = escher.mesh
+    if all(hasattr(mesh, k) for k in ("cone1", "cone2a", "cone2b", "cone3")):
+        idx = [mesh.cone1, mesh.cone2a, mesh.cone3, mesh.cone2b]
+        pts = torch.as_tensor(mesh.points[idx], dtype=torch.float64)
+        with torch.no_grad():
+            corner_px = (
+                project_to_pixels(pts, ctx.mv, ctx.proj, ctx.size, ctx.size)
+                .cpu()
+                .numpy()
+            )
+
     aligned, params, iou = align_mask_to(
-        alpha0, raw, match_area=bool(args.get("MATCH_TILE_AREA", True))
+        alpha0,
+        raw,
+        match_area=bool(args.get("MATCH_TILE_AREA", True)),
+        pixel_weights=weights,
+        corner_px=corner_px,
+        corner_weight=float(args.get("ALIGN_CORNER_WEIGHT", 0.0)),
+        translation_px=float(args.get("ALIGN_TRANSLATION_SEARCH_PX", 0.0)),
+        translation_steps=int(args.get("ALIGN_TRANSLATION_STEPS", 5)),
     )
     print(
         f"target aligned: scale {params['scale']:.3f}, angle {params['angle_deg']:+.1f} deg, "
-        f"initial IoU {iou:.3f}"
+        f"initial IoU {iou:.3f}, area ratio {params['area_ratio']:.4f} "
+        f"({params['area_measure']})"
     )
+
+    # Step-0 residual split + corner status: where would filler land TODAY?
+    inside_t = aligned > 0.5
+    inside_a = alpha0 > 0.5
+    not_covered = float((inside_t & ~inside_a).sum()) / max(inside_t.sum(), 1)
+    outside_tgt = float((inside_a & ~inside_t).sum()) / max(inside_a.sum(), 1)
+    print(
+        f"step-0 residual: target-not-covered {not_covered:.1%}, "
+        f"tile-outside-target {outside_tgt:.1%}"
+    )
+    if corner_px is not None:
+        status = []
+        for name, (col, row) in zip(("cone1", "cone2a", "cone3", "cone2b"), corner_px):
+            r, c = int(round(row)), int(round(col))
+            ok = 0 <= r < inside_t.shape[0] and 0 <= c < inside_t.shape[1] and inside_t[r, c]
+            status.append(f"{name}={'inside' if ok else 'OUTSIDE'}")
+        print(f"pinned corners vs target: {', '.join(status)}")
 
     import imageio.v2 as imageio
 
@@ -183,7 +255,7 @@ def shape_step(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, ar
 
     alpha = soft_alpha(escher, points, ctx)
     mask = args.MASK_LOSS_WEIGHT * mask_pyramid_loss(
-        alpha, target, levels=args.MASK_PYRAMID_LEVELS
+        alpha, target, levels=args.MASK_PYRAMID_LEVELS, pixel_weights=ctx.loss_weights
     )
 
     reg = points.new_zeros(())
@@ -227,6 +299,9 @@ def shape_step(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, ar
         "loss": float(loss.detach()),
         "mask": float(mask.detach()),
         "iou": float(soft_iou(alpha.detach(), target)),
+        "hard_iou": hard_iou(
+            alpha.detach()[0, ..., 0].cpu().numpy(), target.detach().cpu().numpy()
+        ),
         "area_reg": float(reg.detach()),
         "boundary_ratio": escher.boundary_ratio(points),
         "area_spread": float(
@@ -243,21 +318,62 @@ def shape_step(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, ar
     }
 
 
-def log_shape_metrics(output_dir: Path, iteration: int, info: dict) -> None:
-    """Own CSV, own header: ``log_metrics``'s header is hardcoded for the SDS loop."""
+def evaluate_shape(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, args) -> dict:
+    """No-grad metrics of the CURRENT parameters -- exactly what a checkpoint holds.
+
+    ``shape_step`` measures alpha BEFORE its optimizer step, so the loop's last info
+    describes the state one Adam step before the checkpoint saved after it. Ranking a
+    sweep or gating a carve on that stale number is off by one step; this eval is what
+    ``run_shape`` reports and returns.
+    """
+    with torch.no_grad():
+        points, flips, _ = escher.ensure_valid_shape()
+        alpha = soft_alpha(escher, points, ctx)
+        mask = args.MASK_LOSS_WEIGHT * mask_pyramid_loss(
+            alpha, target, levels=args.MASK_PYRAMID_LEVELS, pixel_weights=ctx.loss_weights
+        )
+    areas = np.abs(signed_solid_angles(points.detach().cpu().numpy(), escher.mesh.faces))
+    return {
+        "mask": float(mask),
+        "iou": float(soft_iou(alpha, target)),
+        "hard_iou": hard_iou(alpha[0, ..., 0].cpu().numpy(), target.cpu().numpy()),
+        "boundary_ratio": escher.boundary_ratio(points),
+        "area_spread": float(
+            np.percentile(areas, 99) / max(np.percentile(areas, 1), 1e-30)
+        ),
+        "flips": flips,
+        "energy": escher.embedder.last_result.energy,
+        "solver_iters": (
+            escher.embedder.last_result.stage1.n_iter
+            + escher.embedder.last_result.stage2.n_iter
+        ),
+        "points": points,
+    }
+
+
+def log_shape_metrics(
+    output_dir: Path, iteration: int, info: dict, fresh: bool = False
+) -> None:
+    """Own CSV, own header: ``log_metrics``'s header is hardcoded for the SDS loop.
+
+    ``hard_iou`` is appended LAST: tests and downstream parsers index the earlier
+    columns by position. ``fresh`` truncates -- a re-run into an existing dir used
+    to concatenate two histories with no separator.
+    """
     path = output_dir / "metrics.csv"
-    new = not path.exists()
-    with open(path, "a", encoding="utf-8") as f:
+    new = fresh or not path.exists()
+    with open(path, "w" if fresh else "a", encoding="utf-8") as f:
         if new:
             f.write(
                 "step,loss,mask,iou,area_reg,karcher,"
-                "boundary_ratio,area_spread,flips,reverts,solver_iters\n"
+                "boundary_ratio,area_spread,flips,reverts,solver_iters,hard_iou\n"
             )
         f.write(
             f"{iteration},{info['loss']:.4f},{info['mask']:.4f},{info['iou']:.4f},"
             f"{info['area_reg']:.4f},{info['energy']:.6f},"
             f"{info['boundary_ratio']:.6f},{info['area_spread']:.2f},"
-            f"{info['flips']},{info['reverts']},{info['solver_iters']}\n"
+            f"{info['flips']},{info['reverts']},{info['solver_iters']},"
+            f"{info['hard_iou']:.4f}\n"
         )
 
 
@@ -310,19 +426,60 @@ def save_shape_snapshot(
 def run_shape(args) -> dict:
     escher = build_shape_run(args)
     ctx = make_context(escher, args)
+
+    margin = frame_margin_px(escher, ctx)
+    print(f"frame margin: {margin:.1f} px (undeformed tile on the {ctx.size}px grid)")
+    min_margin = float(args.get("MIN_FRAME_MARGIN_PX", 0.0))
+    if margin < min_margin:
+        raise ValueError(
+            f"undeformed tile margin {margin:.1f} px < MIN_FRAME_MARGIN_PX "
+            f"{min_margin}; widen SHAPE_CAMERA_FOV / SHAPE_RENDER_SIZE or raise "
+            f"SHAPE_CAMERA_DISTANCE"
+        )
+    if margin <= 0:
+        print(
+            "  !! boundary vertices start OUTSIDE the frame -- the loss and metric "
+            "cannot see them; fix the framing before trusting any number from this run"
+        )
+
+    if bool(args.get("SOLID_ANGLE_LOSS_WEIGHTING", False)):
+        from escher.pixel_solid_angle import pixel_solid_angles
+
+        ctx.loss_weights = torch.as_tensor(
+            pixel_solid_angles(ctx.mv, ctx.proj, ctx.size, ctx.size),
+            dtype=torch.float32,
+            device=escher.device,
+        )
+
     target = prepare_target(escher, ctx, args)
+
+    # Optional tau anneal over the final stretch: hard IoU is tau-invariant (the
+    # alpha>0.5 contour is the polygon for ANY tau), but the LOSS's gradient band
+    # narrows and sharpens as tau falls -- right when the residual is a thin
+    # boundary ribbon. Late-only because narrow bands from step 0 risk instability
+    # (raising tau LOWERS peak gradient; see mask_pyramid_loss docstring).
+    base_tau = float(args.MASK_TAU)
+    tau_end = float(args.get("MASK_TAU_END", 0.0) or 0.0)
+    anneal_start = float(args.get("MASK_TAU_ANNEAL_START", 0.8))
+    n_steps = max(int(args.SHAPE_STEPS), 1)
 
     start = time.time()
     info: dict = {}
     for iteration in range(int(args.SHAPE_STEPS) + 1):
+        if tau_end > 0:
+            f = iteration / n_steps
+            if f > anneal_start:
+                t = (f - anneal_start) / max(1.0 - anneal_start, 1e-9)
+                ctx.tau = base_tau + (tau_end - base_tau) * min(t, 1.0)
         info = shape_step(escher, target, ctx, args)
 
         if iteration % 10 == 0:
-            log_shape_metrics(escher.output_dir, iteration, info)
+            log_shape_metrics(escher.output_dir, iteration, info, fresh=iteration == 0)
             per_step = (time.time() - start) / max(iteration, 1)
             print(
                 f"step {iteration:5d} | loss {info['loss']:9.1f} | "
                 f"mask {info['mask']:8.1f} | iou {info['iou']:.4f} | "
+                f"hard {info['hard_iou']:.4f} | "
                 f"reg {info['area_reg']:8.1f} | "
                 f"perim {info['boundary_ratio']:6.4f}x | "
                 f"spread {info['area_spread']:6.1f} | "
@@ -338,16 +495,29 @@ def run_shape(args) -> dict:
             save_shape_snapshot(escher, target, ctx, iteration)
             escher.save_checkpoint(iteration)
 
+    # Post-step eval BEFORE the final checkpoint write: the last optimizer.step()
+    # has never been validity-checked, and evaluate_shape's ensure_valid_shape may
+    # project a folded boundary state back onto the valid set (mutating P). Saving
+    # first could persist the folded shape while every reported metric -- and the
+    # "valid" flag the batch driver trusts -- described the reverted one.
+    final = evaluate_shape(escher, target, ctx, args)
     escher.save_checkpoint(int(args.SHAPE_STEPS))
-    ok, message = escher.check_geometry(info["points"])
+    final_row = {**info, **final, "loss": final["mask"] + info["area_reg"]}
+    log_shape_metrics(escher.output_dir, int(args.SHAPE_STEPS), final_row)
+    ok, message = escher.check_geometry(final["points"])
     print(f"final geometry: {message}")
+    print(
+        f"final iou {final['iou']:.4f} (hard {final['hard_iou']:.4f}) | "
+        f"perim {final['boundary_ratio']:.4f}x"
+    )
     print(f"done in {(time.time() - start) / 60:.1f} min -> {escher.output_dir}")
     return {
         "k": int(args.ORBIFOLD_K),
-        "iou": info["iou"],
-        "boundary_ratio": info["boundary_ratio"],
-        "area_spread": info["area_spread"],
-        "flips": info["flips"],
+        "iou": final["iou"],
+        "hard_iou": final["hard_iou"],
+        "boundary_ratio": final["boundary_ratio"],
+        "area_spread": final["area_spread"],
+        "flips": final["flips"],
         "valid": ok,
         "output_dir": str(escher.output_dir),
     }
@@ -363,6 +533,23 @@ def scaled_n_phi(n_phi_k4: int, k: int) -> int:
     if n % 2 == 0:
         n += 1
     return max(n, 5)
+
+
+def _sweep_rank_key(args):
+    """Winner-selection key for sweeps, by SWEEP_RANK_METRIC.
+
+    ``soft`` (default, the historical behavior) ranks by soft IoU with a HIGHER-
+    perimeter tiebreak. ``hard`` ranks by hard IoU -- the number that corresponds
+    to filler on the sphere, free of the tau bias that penalizes articulated
+    outlines (a perfect carve scores ~0.93 soft at tau 3, and the shortfall grows
+    with perimeter) -- with a LOWER-perimeter tiebreak (less filler boundary).
+    """
+    metric = str(args.get("SWEEP_RANK_METRIC", "soft"))
+    if metric == "hard":
+        return lambda r: (r["hard_iou"], -r["boundary_ratio"])
+    if metric != "soft":
+        raise ValueError(f"SWEEP_RANK_METRIC must be 'soft' or 'hard', got {metric!r}")
+    return lambda r: (r["iou"], r["boundary_ratio"])
 
 
 def sweep(args) -> None:
@@ -381,11 +568,12 @@ def sweep(args) -> None:
         print(f"\n=== k={k} ({2 * int(k)} tiles), n_phi={run_args.MESH_N_PHI} ===")
         results.append(run_shape(run_args))
 
-    lines = ["k,iou,boundary_ratio,area_spread,flips,valid,output_dir"]
+    lines = ["k,iou,boundary_ratio,area_spread,flips,valid,output_dir,hard_iou"]
     for r in results:
         lines.append(
             f"{r['k']},{r['iou']:.4f},{r['boundary_ratio']:.4f},"
-            f"{r['area_spread']:.1f},{r['flips']},{r['valid']},{r['output_dir']}"
+            f"{r['area_spread']:.1f},{r['flips']},{r['valid']},{r['output_dir']},"
+            f"{r['hard_iou']:.4f}"
         )
     sweep_csv = Path(f"{args.OUTPUT_DIR}_sweep.csv")
     sweep_csv.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -393,7 +581,7 @@ def sweep(args) -> None:
 
     valid = [r for r in results if r["valid"] and r["flips"] == 0]
     if valid:
-        best = max(valid, key=lambda r: (r["iou"], r["boundary_ratio"]))
+        best = max(valid, key=_sweep_rank_key(args))
         print(f"\nwinner: k={best['k']} (iou {best['iou']:.4f}) -> {best['output_dir']}")
     else:
         print("\nno valid run -- inspect the overlays before rerunning")
@@ -403,18 +591,32 @@ def _sweep_one(cfg: dict) -> dict | None:
     """One candidate screen, in its own process. Module-level so it pickles.
 
     Takes a plain container rather than an ``OmegaConf`` object, and returns ``None``
-    instead of raising when the candidate has no usable foreground, so one bad
-    generation cannot take the pool down.
+    instead of raising, so one bad candidate cannot take the pool down. RuntimeError
+    is caught too -- a solver/adjoint blowup on one candidate used to kill the whole
+    screen -- and the traceback is preserved in the candidate's output dir rather
+    than silenced.
     """
     torch.set_num_threads(1)
     try:
         return run_shape(OmegaConf.create(cfg))
-    except ValueError:
+    except (ValueError, RuntimeError) as e:
+        import traceback
+
+        out = Path(cfg.get("OUTPUT_DIR", "."))
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        except OSError:
+            pass
+        print(f"  {Path(cfg['TARGET_MASK']).stem}: failed ({type(e).__name__}: {e})")
         return None
 
 
-def sweep_targets(args) -> None:
+def sweep_targets(args) -> dict | None:
     """Carve against every candidate silhouette; keep the one the tiling can actually be.
+
+    Returns the winning result dict (with ``winner_path``), or ``None`` when no
+    candidate was valid -- the CLI maps that to exit code 2.
 
     ``make_target.py`` picks a candidate by figure AREA, which says nothing about whether
     the tiling can adopt that outline. Shapes that tile a surface under a fixed group are
@@ -459,6 +661,13 @@ def sweep_targets(args) -> None:
                     "SHAPE_STEPS": int(args.TARGET_SWEEP_STEPS),
                     "SWEEP_TARGETS": False,
                     "SWEEP_K": [],
+                    # Where candidate carves run. Historically they inherited
+                    # DEVICE=cuda from sphere.yaml -- 8 spawned workers each with
+                    # its own CUDA context, which is fast (the soft mask is ~13x
+                    # faster on GPU) but collides with any concurrent texture run.
+                    # null = inherit (historical); the batch driver passes "cpu"
+                    # so screens can overlap the GPU lane.
+                    "DEVICE": str(args.get("TARGET_SWEEP_DEVICE") or args.DEVICE),
                 },
             ),
             resolve=True,
@@ -492,11 +701,12 @@ def sweep_targets(args) -> None:
         r["target"] = cfg["TARGET_MASK"]
         results.append(r)
 
-    lines = ["target,iou,boundary_ratio,area_spread,flips,valid,output_dir"]
+    lines = ["target,iou,boundary_ratio,area_spread,flips,valid,output_dir,hard_iou"]
     for r in results:
         lines.append(
             f"{Path(r['target']).stem},{r['iou']:.4f},{r['boundary_ratio']:.4f},"
-            f"{r['area_spread']:.1f},{r['flips']},{r['valid']},{r['output_dir']}"
+            f"{r['area_spread']:.1f},{r['flips']},{r['valid']},{r['output_dir']},"
+            f"{r['hard_iou']:.4f}"
         )
     Path(f"{args.OUTPUT_DIR}_targets.csv").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
@@ -506,37 +716,56 @@ def sweep_targets(args) -> None:
     valid = [r for r in results if r["valid"] and r["flips"] == 0]
     if not valid:
         print("\nno valid candidate -- inspect the overlays before rerunning")
-        return
-    best = max(valid, key=lambda r: (r["iou"], r["boundary_ratio"]))
-    chosen = Path(args.TARGET_DIR) / "target.npy"
-    np.save(
-        chosen,
-        load_target_mask(best["target"], int(args.get("TARGET_SMOOTH_RADIUS", 0))),
-    )
+        return None
+    best = max(valid, key=_sweep_rank_key(args))
+    # WINNER_OUT redirects the winner mask to a run-local path; the legacy default
+    # overwrites the shared, committed TARGET_DIR/target.npy in place -- a mutable
+    # rendezvous two concurrent figures would race on.
+    winner_out = args.get("WINNER_OUT", None)
+    chosen = Path(winner_out) if winner_out else Path(args.TARGET_DIR) / "target.npy"
+    chosen.parent.mkdir(parents=True, exist_ok=True)
+    # Save the winner RAW (no morphology): the production carve applies
+    # TARGET_SMOOTH_RADIUS itself on load, and saving it smoothed here meant the
+    # radius was applied TWICE -- eroding exactly the thin fins that make a fish
+    # read as a fish.
+    np.save(chosen, load_target_mask(best["target"]))
     print(
-        f"\nwinner: {Path(best['target']).stem} (iou {best['iou']:.4f}) -> {chosen}\n"
+        f"\nwinner: {Path(best['target']).stem} (iou {best['iou']:.4f}, "
+        f"hard {best['hard_iou']:.4f}) -> {chosen}\n"
         f"  re-run the full carve with TARGET_MASK={chosen}"
     )
+    return {**best, "winner_path": str(chosen)}
 
 
 def main() -> None:
     cli = OmegaConf.from_cli()
     conf_file = cli.pop("CONF_FILE", "configs/sphere_shape.yaml")
-    # sphere.yaml -> sphere_shape.yaml -> CONF_FILE (if different) -> CLI, so overlays
-    # like sphere_shape_weights.yaml stay small deltas on the shape defaults.
+    # sphere.yaml -> sphere_shape.yaml -> CONF_FILE overlays (left to right) -> CLI,
+    # so overlays like sphere_shape_weights.yaml stay small deltas on the shape
+    # defaults. Accepts a LIST like main_sphere's loader; a list used to TypeError.
+    conf_files = [conf_file] if isinstance(conf_file, str) else list(conf_file)
     layers = [
         OmegaConf.load(PATH / "configs/sphere.yaml"),
         OmegaConf.load(PATH / "configs/sphere_shape.yaml"),
     ]
-    if conf_file != "configs/sphere_shape.yaml":
-        layers.append(OmegaConf.load(PATH / conf_file))
+    layers += [
+        OmegaConf.load(PATH / f)
+        for f in conf_files
+        if f != "configs/sphere_shape.yaml"
+    ]
     args = OmegaConf.merge(*layers, cli)
+    # Exit codes are the batch driver's failure vocabulary: 2 = no valid screen
+    # candidate, 3 = carve finished but failed the geometry certificate. Both used
+    # to exit 0 with the failure visible only in stdout.
     if args.get("SWEEP_TARGETS", False):
-        sweep_targets(args)
+        if sweep_targets(args) is None:
+            raise SystemExit(2)
     elif args.SWEEP_K:
         sweep(args)
     else:
-        run_shape(args)
+        result = run_shape(args)
+        if not result["valid"]:
+            raise SystemExit(3)
 
 
 if __name__ == "__main__":

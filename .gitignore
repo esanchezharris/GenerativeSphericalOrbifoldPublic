@@ -13,3 +13,4 @@ output/
 # carve and texture steps run standalone.
 assets/targets/*/target_*.png
 assets/targets/*/contact_sheet.png
+runs/

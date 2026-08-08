@@ -19,6 +19,13 @@ MASK_PYRAMID_LEVELS: 7
 # Soft-edge width of the analytic silhouette, in pixels. Gradients live in this band;
 # the pyramid extends their reach (7 levels: 512 -> 8).
 MASK_TAU: 3.0
+# Anneal tau toward MASK_TAU_END over the final (1 - MASK_TAU_ANNEAL_START) fraction
+# of the carve (0 = off). Hard IoU is tau-invariant (the alpha>0.5 contour IS the
+# polygon at any tau), but the loss band narrows and sharpens as tau falls -- right
+# when the residual is a thin boundary ribbon. Late-only: narrow bands from step 0
+# risk instability (raising tau LOWERS peak gradient; see mask_pyramid_loss).
+MASK_TAU_END: 0.0
+MASK_TAU_ANNEAL_START: 0.8
 BOUNDARY_SMOOTH_WEIGHT: 300.0
 BOUNDARY_SPACING_WEIGHT: 1000.0
 LR_BOUNDARY: 0.01
@@ -32,6 +39,39 @@ SHAPE_STEPS: 400
 # The tile must sit INSIDE the frame with margins so the figure's limbs stay visible
 # and the residual bumps give the boundary something to chase.
 SHAPE_CAMERA_DISTANCE: 2.8
+
+# Shape-phase-only framing overrides (null = RENDER_SIZE / CAMERA_FOV). The measured
+# production (2,3,4) framing (d=2.4, fov=40, 512px) leaves 4.2 px of margin: the
+# PINNED cone corners press the frame edge, and outline excursions past the edge are
+# invisible to loss AND metric. Scaling FOV and grid together (e.g. fov 50 @ 640px)
+# adds real margin at unchanged pixels-per-steradian. run_shape prints the achieved
+# margin at step 0; MIN_FRAME_MARGIN_PX > 0 turns a shortfall into a hard error.
+SHAPE_RENDER_SIZE: null
+SHAPE_CAMERA_FOV: null
+MIN_FRAME_MARGIN_PX: 0
+
+# Area-match measure. Pixel counts are not steradians: per-pixel spherical area
+# varies 2.4x across the tile at the production framing, so a pixel-matched target
+# is 1.032x the tile's PINNED 4pi/|G| -- a structural hard-IoU ceiling of ~0.95
+# before optimization starts. true matches the target to the tile in steradians
+# (escher/pixel_solid_angle.py). The achieved-area bisection that fixes the
+# compute-scale-then-crop bug (shipped fish target delivered 1.9% short) is
+# unconditional either way.
+SOLID_ANGLE_AREA_MATCH: false
+# Weight the finest mask-loss level by per-pixel solid angle too, so the optimizer
+# values coverage per steradian. Experimental; A/B separately from the alignment.
+SOLID_ANGLE_LOSS_WEIGHTING: false
+
+# Pinned-corner-aware alignment (kite domains). The four cone corners can never
+# move; measured on the shipped fish, ALL FOUR sat outside the figure -- each a
+# guaranteed permanent filler spike the alignment was blind to. Weight > 0 scores
+# candidates by iou - w * mean(corner outside-distance)/tile radius. Keep small
+# (0.1-0.3): the carve A/B, not the alignment score, is the arbiter.
+ALIGN_CORNER_WEIGHT: 0.0
+# Offset grid (+-px, on the best rotations) around the centroid-derived placement;
+# the centroid is a moment, not an optimum. 0 = off.
+ALIGN_TRANSLATION_SEARCH_PX: 0
+ALIGN_TRANSLATION_STEPS: 5
 
 # Non-empty (e.g. [4, 6]) runs one shape fit per k into OUTPUT_DIR_k<k> and picks the
 # winner by IoU among certificate-valid runs.
@@ -53,6 +93,16 @@ TARGET_AREA_MAX: 0.6
 # Candidate screens are independent solves; 0 = min(8, cores-2). Each worker pins itself
 # to one BLAS thread so the processes do not oversubscribe the machine.
 TARGET_SWEEP_WORKERS: 0
+# Device for the candidate carves. null = inherit DEVICE (historical: cuda -- each
+# worker owns a CUDA context; the soft mask is ~13x faster on GPU). Set "cpu" when
+# a texture run holds the GPU (the batch driver does this to overlap lanes).
+TARGET_SWEEP_DEVICE: null
+# Winner selection for sweeps. "soft" = historical (soft IoU, higher-perimeter
+# tiebreak). "hard" = hard IoU (the filler-relevant, tau-free number) with a
+# LOWER-perimeter tiebreak; soft IoU's tau band penalizes articulated outlines by
+# ~4 px of union per unit of perimeter, biasing selection against exactly the
+# candidates this project wants.
+SWEEP_RANK_METRIC: "soft"
 
 # Close-then-open radius applied to the target mask before fitting, in pixels. Diffusion
 # silhouettes arrive with pixel-scale jaggies (visible on the fish target's tail) and the

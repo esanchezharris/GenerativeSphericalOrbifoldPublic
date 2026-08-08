@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from scipy import ndimage
 from torch import Tensor
 
-__all__ = ["binarize_mask", "align_mask_to", "soft_iou", "mask_pyramid_loss"]
+__all__ = ["binarize_mask", "align_mask_to", "soft_iou", "hard_iou", "mask_pyramid_loss"]
 
 
 def _to_grayscale(image: np.ndarray) -> np.ndarray:
@@ -109,11 +109,23 @@ def _moments(mask: np.ndarray) -> tuple[np.ndarray, float]:
     return centroid, float(np.sqrt((w * r2).sum() / total))
 
 
-def _hard_iou(a: np.ndarray, b: np.ndarray) -> float:
-    a = a > 0.5
-    b = b > 0.5
+def hard_iou(a: np.ndarray, b: np.ndarray) -> float:
+    """Binary IoU after thresholding both masks at 0.5.
+
+    This is the number that corresponds to "filler" on the sphere. :func:`soft_iou`
+    compares a sigmoid-softened alpha against a binary target, so a mathematically
+    perfect carve reports ~0.93 at ``MASK_TAU`` 3 -- and the shortfall *grows with
+    perimeter*, biasing any soft-IoU ranking against articulated outlines. With the
+    sigmoid mask, alpha > 0.5 exactly iff the pixel center is inside the polygon, so
+    thresholding removes the tau dependence entirely.
+    """
+    a = np.asarray(a) > 0.5
+    b = np.asarray(b) > 0.5
     union = np.logical_or(a, b).sum()
     return float(np.logical_and(a, b).sum() / max(union, 1))
+
+
+_hard_iou = hard_iou  # internal alias, kept for call sites below
 
 
 def align_mask_to(
@@ -128,6 +140,11 @@ def align_mask_to(
     # truncation.)
     angles_deg: tuple[float, float, int] = (-180.0, 180.0, 49),
     match_area: bool = False,
+    pixel_weights: np.ndarray | None = None,
+    corner_px: np.ndarray | None = None,
+    corner_weight: float = 0.0,
+    translation_px: float = 0.0,
+    translation_steps: int = 5,
 ) -> tuple[np.ndarray, dict, float]:
     """Place ``target`` over ``reference`` by a similarity transform, maximizing IoU.
 
@@ -138,16 +155,36 @@ def align_mask_to(
     them, with the translation re-derived from centroids at each candidate. One-time,
     CPU, seconds.
 
-    ``match_area=True`` replaces the scale search with the single AREA-MATCHED scale
-    (target area == reference area), searching only rotation. This matters whenever the
-    tile's area is conserved -- which is every orbifold parameterization here: the
-    tiling must cover its surface, so the tile's area is pinned at ``|surface|/|G|``
-    and a smaller target caps IoU at ``target_area / tile_area`` STRUCTURALLY.
-    Measured: the planar torus carve converged to 0.7106 with the free-scale
-    alignment's area ratio at exactly 0.71.
+    ``match_area=True`` searches only rotation and, per rotation, BISECTS the scale so
+    the *achieved* area of the placed mask -- measured after the transform, i.e. after
+    anything leaving the frame has been cropped -- equals the reference's. This
+    matters whenever the tile's area is conserved, which is every orbifold
+    parameterization here: the tiling must cover its surface, so the tile's area is
+    pinned at ``|surface|/|G|`` and a smaller target caps IoU at
+    ``target_area / tile_area`` STRUCTURALLY. Measured: the planar torus carve
+    converged to 0.7106 with the free-scale alignment's area ratio at exactly 0.71;
+    the closed-form pre-transform scale it replaces delivered the shipped fish target
+    1.9% short because the transform cropped what the scale had already counted.
 
-    Returns ``(aligned_mask, {"scale", "angle_deg", "shift"}, best_iou)`` with
-    ``aligned_mask`` sampled on the reference's grid.
+    ``pixel_weights`` (e.g. :func:`escher.pixel_solid_angle.pixel_solid_angles`)
+    changes the measure that equality holds in: with the per-pixel spherical area it
+    matches the target to the tile in STERADIANS -- the measure the area pinning
+    actually lives in -- instead of pixels (2.4x per-pixel spread at the production
+    framing, a structural hard-IoU ceiling of ~0.95).
+
+    ``corner_px`` (``(4, 2)`` pixel positions, col/row) are the tile's PINNED cone
+    corners: four outline points the carve can never move. A corner outside the
+    figure is a guaranteed permanent filler spike (the shipped fish had all four
+    outside), so with ``corner_weight`` > 0 candidates are scored by
+    ``iou - corner_weight * mean(dist_outside(corner)) / r_ref`` -- trading a
+    little raw step-0 IoU for residual the optimizer can actually remove.
+    ``translation_px`` > 0 additionally searches an offset grid around the
+    centroid-derived placement (on the best rotations only; the centroid is a
+    moment, not an optimum). Both apply to the ``match_area`` path.
+
+    Returns ``(aligned_mask, params, best_iou)``; ``params`` records scale,
+    angle_deg, shift, achieved ``area_ratio``/``area_measure``, and per-corner
+    outside distances (``corner_dist_px``) when corners were given.
     """
     ref = np.asarray(reference, dtype=np.float64)
     tgt = np.asarray(target, dtype=np.float64)
@@ -155,33 +192,97 @@ def align_mask_to(
     c_tgt, r_tgt = _moments(tgt)
     base_scale = r_ref / r_tgt
 
+    weights = None if pixel_weights is None else np.asarray(pixel_weights, np.float64)
+
+    def masked_area(m: np.ndarray) -> float:
+        inside = m > 0.5
+        return float(inside.sum()) if weights is None else float(weights[inside].sum())
+
+    def place(s: float, angle: float, delta: np.ndarray | None = None) -> np.ndarray:
+        theta = np.deg2rad(angle)
+        rot = np.array(
+            [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]]
+        )
+        # scipy's affine_transform pulls: output[y] = input[M @ y + offset], so M is
+        # the INVERSE map (reference frame -> target frame).
+        M = rot.T / s
+        anchor = c_ref if delta is None else c_ref + delta
+        offset = c_tgt - M @ anchor
+        return ndimage.affine_transform(
+            tgt, M, offset=offset, output_shape=ref.shape, order=0, cval=0.0
+        )
+
+    corners = None if corner_px is None else np.asarray(corner_px, dtype=np.float64)
+
+    def score(aligned: np.ndarray) -> tuple[float, float, np.ndarray | None]:
+        """(ranking score, plain IoU, per-corner outside distance px)."""
+        iou = _hard_iou(aligned, ref)
+        if corners is None or corner_weight <= 0.0:
+            return iou, iou, None
+        inside = aligned > 0.5
+        dt = ndimage.distance_transform_edt(~inside)
+        rows = np.clip(np.round(corners[:, 1]).astype(int), 0, ref.shape[0] - 1)
+        cols = np.clip(np.round(corners[:, 0]).astype(int), 0, ref.shape[1] - 1)
+        dists = dt[rows, cols]
+        return iou - corner_weight * float(dists.mean()) / max(r_ref, 1e-9), iou, dists
+
+    ref_area = masked_area(ref)
+    best = (-2.0, -1.0, None, None, None)  # score, iou, aligned, params, dists
     if match_area:
-        area_scale = float(np.sqrt((ref > 0.5).sum() / max((tgt > 0.5).sum(), 1)))
-        scale_grid = [area_scale / base_scale]  # one multiplier: exact area match
-    else:
-        scale_grid = np.linspace(*scales)
-
-    best = (None, None, -1.0)
-    for mult in scale_grid:
+        s_est = float(np.sqrt((ref > 0.5).sum() / max((tgt > 0.5).sum(), 1)))
+        stage1 = []
         for angle in np.linspace(*angles_deg):
-            s = base_scale * mult
-            theta = np.deg2rad(angle)
-            rot = np.array(
-                [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]]
-            )
-            # scipy's affine_transform pulls: output[y] = input[M @ y + offset], so M is
-            # the INVERSE map (reference frame -> target frame).
-            M = rot.T / s
-            offset = c_tgt - M @ c_ref
-            aligned = ndimage.affine_transform(
-                tgt, M, offset=offset, output_shape=ref.shape, order=0, cval=0.0
-            )
-            iou = _hard_iou(aligned, ref)
-            if iou > best[2]:
-                best = (aligned, {"scale": s, "angle_deg": float(angle)}, iou)
+            lo, hi = 0.5 * s_est, 2.0 * s_est
+            while masked_area(place(hi, angle)) < ref_area and hi < 4.0 * s_est:
+                hi *= 1.4
+            s = s_est
+            for _ in range(11):
+                s = 0.5 * (lo + hi)
+                if masked_area(place(s, angle)) < ref_area:
+                    lo = s
+                else:
+                    hi = s
+            aligned = place(s, angle)
+            sc, iou, dists = score(aligned)
+            stage1.append((sc, float(s), float(angle)))
+            if sc > best[0]:
+                best = (sc, iou, aligned, {"scale": s, "angle_deg": float(angle)}, dists)
 
-    aligned, params, iou = best
+        if translation_px > 0:
+            # Offset grid on the best rotations only; the scale from stage 1 is kept
+            # (a few-px shift barely changes the achieved area).
+            stage1.sort(key=lambda c: -c[0])
+            offsets = np.linspace(-translation_px, translation_px, int(translation_steps))
+            for _, s, angle in stage1[:5]:
+                for dy in offsets:
+                    for dx in offsets:
+                        if dy == 0.0 and dx == 0.0:
+                            continue
+                        aligned = place(s, angle, delta=np.array([dy, dx]))
+                        sc, iou, dists = score(aligned)
+                        if sc > best[0]:
+                            best = (
+                                sc,
+                                iou,
+                                aligned,
+                                {"scale": s, "angle_deg": angle, "delta_px": (dy, dx)},
+                                dists,
+                            )
+    else:
+        for mult in np.linspace(*scales):
+            for angle in np.linspace(*angles_deg):
+                s = base_scale * mult
+                aligned = place(s, angle)
+                sc, iou, dists = score(aligned)
+                if sc > best[0]:
+                    best = (sc, iou, aligned, {"scale": s, "angle_deg": float(angle)}, dists)
+
+    _, iou, aligned, params, dists = best
     params["shift"] = tuple((c_ref - c_tgt).tolist())
+    params["area_ratio"] = masked_area(aligned) / max(ref_area, 1e-12)
+    params["area_measure"] = "solid_angle" if weights is not None else "pixels"
+    if dists is not None:
+        params["corner_dist_px"] = [float(d) for d in dists]
     return aligned.astype(np.float32), params, iou
 
 
@@ -198,7 +299,12 @@ def soft_iou(alpha: Tensor, target: Tensor) -> Tensor:
     return (inter / union.clamp(min=1e-9)).mean()
 
 
-def mask_pyramid_loss(alpha: Tensor, target: Tensor, levels: int = 5) -> Tensor:
+def mask_pyramid_loss(
+    alpha: Tensor,
+    target: Tensor,
+    levels: int = 5,
+    pixel_weights: Tensor | None = None,
+) -> Tensor:
     """Multi-scale MSE between rendered alpha ``(B, H, W, 1)`` and the target ``(H, W)``.
 
     The pyramid helps, but NOT for the reason originally recorded here. That rationale --
@@ -220,8 +326,15 @@ def mask_pyramid_loss(alpha: Tensor, target: Tensor, levels: int = 5) -> Tensor:
     a = alpha.permute(0, 3, 1, 2)  # (B, 1, H, W)
     t = target.to(a).reshape(1, 1, *target.shape).expand(a.shape[0], -1, -1, -1)
     loss = a.new_zeros(())
-    for _ in range(levels):
-        loss = loss + F.mse_loss(a, t)
+    for level in range(levels):
+        if level == 0 and pixel_weights is not None:
+            # Optional solid-angle weighting of the finest level: the optimizer then
+            # values coverage per steradian instead of per pixel. Normalized to mean
+            # 1 so MASK_LOSS_WEIGHT keeps its calibrated magnitude.
+            w = pixel_weights.to(a).reshape(1, 1, *pixel_weights.shape[-2:])
+            loss = loss + (w / w.mean().clamp_min(1e-12) * (a - t).square()).mean()
+        else:
+            loss = loss + F.mse_loss(a, t)
         if min(a.shape[-2:]) < 2:
             break
         a = F.avg_pool2d(a, 2)

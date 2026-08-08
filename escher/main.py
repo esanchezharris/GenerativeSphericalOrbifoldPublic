@@ -68,7 +68,9 @@ def load_planar_args(cli=None):
     REPLACED the base config, so a phase overlay silently dropped every default it did
     not restate."""
     cli = OmegaConf.from_cli() if cli is None else cli
-    conf_file = cli.get("CONF_FILE", "configs/base.yaml")
+    # pop, not get: CONF_FILE otherwise leaks into the merged args and the saved
+    # checkpoint config.
+    conf_file = cli.pop("CONF_FILE", "configs/base.yaml")
     layers = [OmegaConf.load(PATH / "configs/base.yaml")]
     if conf_file != "configs/base.yaml":
         layers.append(OmegaConf.load(PATH / f"{conf_file}"))

@@ -1,0 +1,59 @@
+# The acceptance batch: reproduces the fish end-to-end twice through the new
+# driver -- Run 1 with the proven texture recipe on the improved carve, Run 2
+# adding the zero-background levers -- and validates all four gates at once
+# (speed via timing/wall-clock, carve hard IoU, bg_frac, unattended operation).
+#
+#   python -m escher.pipeline escher/configs/batch_acceptance.yaml
+#
+# Both jobs reuse the shipped 64 fish silhouette candidates (no GPU target
+# stage), screen them with the A/B-winning recipe on the GPU (the lane is free
+# until the first texture starts), and carve on CPU under the texture overlap.
+
+batch_name: acceptance_fish
+runs_root: runs
+
+defaults:
+  orbifold: [2, 3, 4]
+  seeds: [0]
+  texture_seeds: [0]
+  reuse_targets: /mnt/c/Users/dawha/orbifold/assets/targets/fish64
+  stages:
+    screen:
+      CONF_FILE: [configs/sphere_shape_weights_fish2.yaml]
+      TARGET_SWEEP_STEPS: 150
+      KEEP_CHECKPOINTS: 1
+    carve:
+      CONF_FILE: [configs/sphere_shape_weights_fish2.yaml]
+      SHAPE_STEPS: 1500
+      KEEP_CHECKPOINTS: 2
+    render:
+      TINT: true
+
+jobs:
+  - figure: fish_run1
+    prompt: "a fish with scales and fins, flat vector illustration, solid pastel colors, simple shapes, a masterpiece"
+    stages:
+      # Job 1's shape stages may claim the idle GPU (~13x faster): nothing else
+      # can hold it before job 1's own texture, which depends on them. Job 2's
+      # shape work stays on CPU to overlap texture 1.
+      screen:
+        TARGET_SWEEP_DEVICE: "cuda"
+        TARGET_SWEEP_WORKERS: 4
+      carve:
+        DEVICE: "cuda"
+      texture:
+        CONF_FILE: [configs/sphere_texture.yaml, configs/sphere_texture_octa.yaml]
+        COTANGENT_RELATIVE_WEIGHTS: true
+        TORCH_COMPILE: true
+        TIMING: true
+        KEEP_CHECKPOINTS: 5
+
+  - figure: fish_run2
+    prompt: "a fish with scales and fins, flat vector illustration, solid pastel colors, simple shapes, the fish fills the entire frame edge to edge, a masterpiece"
+    stages:
+      texture:
+        CONF_FILE: [configs/sphere_texture.yaml, configs/sphere_texture_octa.yaml, configs/sphere_texture_octa_nobg.yaml]
+        COTANGENT_RELATIVE_WEIGHTS: true
+        TORCH_COMPILE: true
+        TIMING: true
+        KEEP_CHECKPOINTS: 5

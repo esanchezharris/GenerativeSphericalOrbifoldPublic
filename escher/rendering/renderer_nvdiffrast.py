@@ -26,6 +26,40 @@ def _warmup(glctx):
     dr.rasterize(glctx, pos, tri, resolution=[256, 256])
 
 
+# Created lazily and cached, mirroring render_tiling_core.py. The sphere training path
+# never passed a context in, so a fresh RasterizeGLContext was created AND warmed on
+# every render call -- once per SDS step, twice more per snapshot, 30 times in a
+# turntable. Contexts are designed for reuse; every other renderer entry point in the
+# repo caches one. Per-process on purpose: the spawn-based sweep workers re-import this
+# module and each lazily builds its own.
+_default_ctx = None
+_default_kind = "gl"
+
+
+def set_default_context_kind(kind: str) -> None:
+    """Select the default rasterizer: ``gl`` (bit-identical to all prior runs) or
+    ``cuda``. The two are different rasterizer implementations -- edge pixels can
+    differ at exact coverage ties -- so ``cuda`` is an opt-in A/B, never a silent
+    default flip."""
+    global _default_ctx, _default_kind
+    if kind not in ("gl", "cuda"):
+        raise ValueError(f"RASTER_CONTEXT must be 'gl' or 'cuda', got {kind!r}")
+    if kind != _default_kind:
+        _default_kind = kind
+        _default_ctx = None
+
+
+def _get_default_context():
+    global _default_ctx
+    if _default_ctx is None:
+        if _default_kind == "cuda":
+            _default_ctx = dr.RasterizeCudaContext()
+        else:
+            _default_ctx = dr.RasterizeGLContext()
+            _warmup(_default_ctx)
+    return _default_ctx
+
+
 def render_mesh_nvdiffrast(
     vertices: torch.Tensor,  # B,V,3,
     faces: torch.Tensor,  # V,3,
@@ -102,11 +136,9 @@ def render_mesh_nvdiffrast(
     # or
     # col = torch.flip(col, 1)
 
-    # Check if gltctx is provided, otherwise create a new one
+    # Use the caller's context when given, else the cached per-process default.
     if glctx is None:
-        glctx = dr.RasterizeGLContext()
-        # glctx = dr.RasterizeCudaContext(torch.device("cuda"))
-        _warmup(glctx)
+        glctx = _get_default_context()
 
     # Rasterize data
     rast_out, rast_out_db = dr.rasterize(glctx, vertices_clip, faces, resolution=image_size, grad_db=True)  # C,H,W,4

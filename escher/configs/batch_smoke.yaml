@@ -1,0 +1,44 @@
+# Tiny CPU smoke spec for the batch driver's --dry-run mode (tests + sanity).
+# Geometry from the proven CPU test recipe; GPU stages are stubbed. Whole chain
+# runs in under a minute:
+#
+#   python -m escher.pipeline escher/configs/batch_smoke.yaml --dry-run
+
+batch_name: smoke
+runs_root: runs
+
+defaults:
+  orbifold: null   # dihedral lune, boundary mode -- the fast tiny-mesh path
+  seeds: [0, 1]
+  texture_seeds: [0]
+  stages:
+    screen:
+      MESH_N_THETA: 6
+      MESH_N_PHI: 5
+      RENDER_SIZE: 64
+      MASK_PYRAMID_LEVELS: 3
+      TARGET_SWEEP_STEPS: 2
+      TARGET_SWEEP_WORKERS: 1
+      TARGET_SMOOTH_RADIUS: 0
+      SWEEP_RANK_METRIC: "hard"
+      DEVICE: "cpu"
+    carve:
+      MESH_N_THETA: 6
+      MESH_N_PHI: 5
+      RENDER_SIZE: 64
+      MASK_PYRAMID_LEVELS: 3
+      SHAPE_STEPS: 3
+      VISUALIZATION_FREQ: 2
+      TARGET_SMOOTH_RADIUS: 0
+      KEEP_CHECKPOINTS: 1
+      DEVICE: "cpu"
+    texture:
+      MESH_N_THETA: 6
+      MESH_N_PHI: 5
+      DEVICE: "cpu"
+
+jobs:
+  - figure: disk
+    prompt: "a plain disk"
+  - figure: ellipse
+    prompt: "a plain ellipse"

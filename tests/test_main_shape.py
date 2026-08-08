@@ -77,8 +77,11 @@ def test_run_shape_moves_p_logs_iou_and_checkpoints(tmp_path):
 
     header = (out / "metrics.csv").read_text(encoding="utf-8").splitlines()[0]
     assert header.split(",")[3] == "iou"
+    # hard_iou is appended LAST so the positional parses above stay valid.
+    assert header.split(",")[-1] == "hard_iou"
     assert result["k"] == args.ORBIFOLD_K
     assert 0.0 < result["iou"] <= 1.0
+    assert 0.0 < result["hard_iou"] <= 1.0
 
     # the optimizer must actually have moved the boundary
     escher = build_shape_run(args)
@@ -185,6 +188,54 @@ def test_sweep_targets_ranking_is_worker_count_independent(tmp_path):
         return [(r.split(",")[0], round(float(r.split(",")[1]), 4)) for r in rows]
 
     assert run(1) == run(3)
+
+
+def test_sweep_winner_saved_unsmoothed_and_hard_rank(tmp_path):
+    """The winner npy must be the RAW binarized mask: the carve applies
+    TARGET_SMOOTH_RADIUS itself on load, and saving it smoothed meant the radius
+    ran twice, eroding thin features. Also smoke-tests SWEEP_RANK_METRIC=hard."""
+    import imageio.v2 as imageio
+
+    from escher.main_shape import load_target_mask, sweep_targets
+
+    tdir = tmp_path / "cands"
+    tdir.mkdir()
+    yy, xx = np.meshgrid(np.arange(64), np.arange(64), indexing="ij")
+    for i, r in enumerate((12, 16)):
+        m = ((yy - 32) ** 2 + (xx - 32) ** 2 <= r * r).astype(np.uint8) * 255
+        imageio.imwrite(tdir / f"target_{i:02d}.png", m)
+
+    args = tiny_args(tmp_path)
+    args.PARAM_MODE = "weights"
+    args.SWEEP_TARGETS = True
+    args.TARGET_DIR = str(tdir)
+    args.TARGET_SWEEP_STEPS = 2
+    args.TARGET_SWEEP_WORKERS = 1
+    args.TARGET_SMOOTH_RADIUS = 2
+    args.SWEEP_RANK_METRIC = "hard"
+    args.OUTPUT_DIR = str(tmp_path / "sw")
+    sweep_targets(args)
+
+    saved = np.load(tdir / "target.npy")
+    raw_candidates = [
+        load_target_mask(tdir / f"target_{i:02d}.png") for i in range(2)
+    ]
+    assert any(np.array_equal(saved, raw) for raw in raw_candidates), (
+        "winner must equal a RAW binarized candidate, with no morphology applied"
+    )
+
+
+def test_tau_anneal_smoke(tmp_path):
+    """MASK_TAU_END > 0 anneals the loss band late in the run and must not break
+    the carve (hard IoU is tau-invariant by construction)."""
+    args = tiny_args(tmp_path)
+    args.PARAM_MODE = "weights"
+    args.MASK_TAU_END = 1.0
+    args.MASK_TAU_ANNEAL_START = 0.5
+    args.OUTPUT_DIR = str(tmp_path / "tau")
+    result = run_shape(args)
+    assert 0.0 < result["hard_iou"] <= 1.0
+    assert result["flips"] == 0
 
 
 def test_scaled_n_phi():

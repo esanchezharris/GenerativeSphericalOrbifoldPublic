@@ -13,9 +13,12 @@ KITE_N: 20
 # solid angle, ~1.58x smaller linearly -- so the (2,3,4) framing would leave the tile
 # small in frame, and "tile too small / tile fills the frame" has produced a flat mask
 # loss twice in this project. Distance is bounded below by the unit sphere, so the knob
-# is FOV: 40 / 1.58 ~= 25. VERIFY against step_00000.png before trusting any metric.
+# is FOV. The original 40 / 1.58 ~= 26 derivation was measured WRONG: at fov 26 eight
+# boundary vertices start -18.5 px OUTSIDE the frame (invisible to loss and metric).
+# Measured margins at d=2.4 on the 512 grid: fov 26 -> -18.5 px, 30 -> +19.4,
+# 32 -> +34.8. run_shape now prints the margin at step 0; keep it positive.
 SHAPE_CAMERA_DISTANCE: 2.4
-CAMERA_FOV: 26.0
+CAMERA_FOV: 32.0
 
 LR_W: 0.03
 W_RANGE: 0.95

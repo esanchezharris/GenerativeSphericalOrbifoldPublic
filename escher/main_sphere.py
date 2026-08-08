@@ -49,6 +49,7 @@ from escher.geometry.spherical_sanity_checks import (
     count_flipped_faces,
     signed_solid_angles,
 )
+from escher.misc.timing import PhaseTimer
 from escher.rendering.camera import orbit_views, tile_centric_views
 from escher.rendering.render_sphere_nvdiffrast import build_tiled_sphere, render_tiled_sphere
 
@@ -67,9 +68,47 @@ def texture_tv(texture: torch.Tensor) -> torch.Tensor:
     return dx.square().mean() + dy.square().mean()
 
 
+def texture_fill_loss(
+    texture: torch.Tensor, valid: torch.Tensor, chroma_min: float
+) -> torch.Tensor:
+    """Chroma floor on the sampled texels: no pixel of the tile may read as background.
+
+    Root-cause fix for the tint-invariant filler: the per-tile hue rotation is a
+    rotation about the RGB gray axis, so ACHROMATIC pixels are exact fixed points --
+    white/gray paint renders identically in all 24 tiles and reads as one continuous
+    background field, defeating the 3-coloring that makes the tiling legible. A
+    floor on chroma (max-min over RGB) guarantees every rasterized texel
+    participates in the palette alternation. Quadratic shortfall, mean over the
+    VALID (actually sampled) texels only.
+
+    Known flat spot: an EXACTLY equal RGB triple has zero gradient (max and min
+    route to the same channel -- true of any symmetric chroma measure). Harmless
+    in training: the init color is chromatic tan and per-step SDS noise breaks
+    channel ties immediately; the offline polish scrub covers any texel that
+    somehow stays pinned there.
+    """
+    chroma = texture.max(dim=-1).values - texture.min(dim=-1).values
+    shortfall = (chroma_min - chroma).clamp_min(0.0)
+    return shortfall[valid].square().mean()
+
+
 # Shared with the planar pipeline; re-exported here because tests and older call sites
 # import them from main_sphere.
 from escher.guidance.schedule import annealed_max_step, arm_sds  # noqa: E402,F401
+
+
+def apply_backend_flags(args) -> None:
+    """Opt-in GPU backend toggles, all default OFF.
+
+    Each changes kernel/algorithm selection, so runs are statistically -- not
+    bitwise -- comparable with them on. cudnn.benchmark is the natural fit here:
+    every conv shape in the loop is static (4x512^2 VAE, batch-8 64^2 UNet).
+    """
+    if bool(args.get("CUDNN_BENCHMARK", False)):
+        torch.backends.cudnn.benchmark = True
+    if bool(args.get("ALLOW_TF32", False)):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 
 class SphereEscher:
@@ -78,6 +117,7 @@ class SphereEscher:
     def __init__(self, args):
         self.args = args
         self.device = torch.device(args.DEVICE)
+        apply_backend_flags(args)
         torch.manual_seed(args.SEED)
         np.random.seed(args.SEED)
 
@@ -91,6 +131,12 @@ class SphereEscher:
     # ------------------------------------------------------------------------- setup
     def _init_geometry(self):
         a = self.args
+        # Rasterizer choice for the cached default context; runs here because every
+        # construction path (train, shape phase, render_final) passes through
+        # _init_geometry, unlike __init__.
+        from escher.rendering.renderer_nvdiffrast import set_default_context_kind
+
+        set_default_context_kind(str(a.get("RASTER_CONTEXT", "gl")))
         if a.PARAM_MODE == "boundary":
             # Free side of the cut as direct parameters; interior follows a fixed-boundary
             # cotangent solve. Dihedral (k,2,2) on the lune by default; ORBIFOLD_CONES
@@ -201,6 +247,7 @@ class SphereEscher:
         # should be, on every orbifold.
         self._last_info: dict | None = None
         self._frozen_at: int | None = None
+        self._frozen_cache: dict | None = None
         self.faces_t = torch.as_tensor(self.mesh.faces, dtype=torch.long)
         with torch.no_grad():
             self.ref_areas = spherical_face_areas(self.solve_points(), self.faces_t).detach()
@@ -215,6 +262,8 @@ class SphereEscher:
             guidance_scale=a.GUIDANCE_SCALE,
             half_precision_weights=a.USE_HALF_PRECISION,
             grad_clip=[0, 2.0, 8.0, 1000] if a.CLIP_GRADIENTS_IN_SDS else None,
+            enable_channels_last_format=bool(a.get("CHANNELS_LAST", False)),
+            torch_compile=bool(a.get("TORCH_COMPILE", False)),
         )
         self.guidance = sd.StableDiffusion(cfg)
         # The silhouette pass shows the model a flat solid shape, so it gets a prompt that
@@ -333,6 +382,49 @@ class SphereEscher:
             return self.embedder(self.b_orb.boundary_b(self.P))
         return self.embedder(self.edge_weights())
 
+    def texture_valid_mask(self) -> torch.Tensor:
+        """Bool ``(R, R)`` of texels the mesh actually samples, cached."""
+        mask = getattr(self, "_tex_valid_mask", None)
+        if mask is None:
+            from escher.rendering.texture_mask import uv_valid_mask
+
+            mask = torch.as_tensor(
+                uv_valid_mask(
+                    self.mesh.uv, self.mesh.faces, int(self.args.TEXTURE_RESOLUTION)
+                ),
+                device=self.device,
+            )
+            self._tex_valid_mask = mask
+        return mask
+
+    def _frozen_solve(self) -> dict:
+        """Solve ONCE at the freeze latch; reuse the detached result afterwards.
+
+        Valid because the freeze is latched (shape_frozen) and apply_shape_freeze
+        runs before every optimizer.step from the latch on: the shape parameter is
+        bit-frozen, so re-solving produced the identical answer -- 7000 times per
+        texture run, twice per step. Detaching also removes the implicit-function
+        adjoint (one sparse-LU per backward) whose gradient apply_shape_freeze then
+        zeroed unread, and lets nvdiffrast skip its vertex-position/antialias
+        gradient work. Invalidated on checkpoint load.
+        """
+        cache = self._frozen_cache
+        if cache is None:
+            with torch.no_grad():
+                points = self.solve_points()
+            self._frozen_cache = cache = {
+                "points": points.detach(),
+                "flips": count_flipped_faces(
+                    points.detach().cpu().numpy(), self.mesh.faces
+                ),
+                "energy": self.embedder.last_result.energy,
+                "solver_iters": (
+                    self.embedder.last_result.stage1.n_iter
+                    + self.embedder.last_result.stage2.n_iter
+                ),
+            }
+        return cache
+
     def ensure_valid_shape(self) -> tuple[torch.Tensor, int, bool]:
         r"""Solve; if the boundary folded the interior, revert to the last valid ``P``.
 
@@ -405,6 +497,7 @@ class SphereEscher:
         texture: torch.Tensor | None = None,
         tint: torch.Tensor | None = None,
         shade_ambient: float | None = None,
+        points: torch.Tensor | None = None,
     ):
         """Render the tiling, or a single tile alone against the background.
 
@@ -413,8 +506,15 @@ class SphereEscher:
         into the prompt's figure -- with the full tiling every view is completely covered by
         tiles, leaving no silhouette to push on, and only the texture can respond. The planar
         pipeline gets this for free by rendering one fundamental domain.
+
+        ``points`` lets the caller reuse an existing solve (step() passes the one from
+        its validity projection). Without it, the frozen cache is used when the shape
+        is latched -- snapshots and the silhouette pass then cost no extra solves --
+        and only otherwise does the render solve for itself.
         """
-        points = self.solve_points()
+        if points is None:
+            cached = getattr(self, "_frozen_cache", None)
+            points = cached["points"] if cached is not None else self.solve_points()
         group = self.solo_tiler if isolated else self.tiler
         sphere = build_tiled_sphere(
             points.to(self.device).float(), self.mesh.faces, self.mesh.uv, group
@@ -535,8 +635,22 @@ class SphereEscher:
 
         frozen = self.shape_frozen(iteration)
 
-        # Validity projection BEFORE anything uses this step's geometry.
-        _, flips, reverted = self.ensure_valid_shape()
+        # Validity projection BEFORE anything uses this step's geometry. Once frozen
+        # the parameters provably cannot move, so the solve runs once at the latch
+        # and the detached result is reused (_frozen_solve). Unfrozen, the ONE solve
+        # here is passed to render() -- it used to solve again for itself.
+        with self.timer.phase("solve"):
+            if frozen:
+                cache = self._frozen_solve()
+                points_in, flips, reverted = cache["points"], cache["flips"], False
+                energy, solver_iters = cache["energy"], cache["solver_iters"]
+            else:
+                points_in, flips, reverted = self.ensure_valid_shape()
+                energy = self.embedder.last_result.energy
+                solver_iters = (
+                    self.embedder.last_result.stage1.n_iter
+                    + self.embedder.last_result.stage2.n_iter
+                )
         if reverted:
             self._n_reverts += 1
             self.reset_shape_optimizer_state()
@@ -546,7 +660,10 @@ class SphereEscher:
         # The fraction sets the actual cadence (0.5 -> every 2nd step), not just on/off.
         frac = a.ISOLATED_TILE_FRACTION
         isolated = frac > 0 and iteration % max(1, round(1.0 / frac)) == 0
-        images, alpha, points = self.render(a.IMAGE_BATCH_SIZE, isolated=isolated)
+        with self.timer.phase("render"):
+            images, alpha, points = self.render(
+                a.IMAGE_BATCH_SIZE, isolated=isolated, points=points_in
+            )
 
         if a.RANDOM_BACKGROUND:
             bg = torch.rand(images.shape[0], 1, 1, 3, device=self.device)
@@ -555,7 +672,8 @@ class SphereEscher:
         composited = images * alpha + bg * (1.0 - alpha)
 
         # train_step returns (loss, sampled timestep); the timestep is diagnostic only.
-        loss, timestep = self.guidance.train_step(composited, self.text_embeds)
+        with self.timer.phase("sds"):
+            loss, timestep = self.guidance.train_step(composited, self.text_embeds)
 
         # Shape regularizers ride the main backward: their graphs are tiny (points -> areas
         # and W -> sum of squares), so unlike a second diffusion pass they cost no VRAM.
@@ -584,6 +702,13 @@ class SphereEscher:
         tv_w = a.get("TEXTURE_TV_WEIGHT", 0.0)
         if tv_w > 0:
             loss = loss + tv_w * texture_tv(self.texture)
+        fill_w = a.get("TEXTURE_FILL_WEIGHT", 0.0)
+        if fill_w and fill_w > 0:
+            loss = loss + fill_w * texture_fill_loss(
+                self.texture,
+                self.texture_valid_mask(),
+                float(a.get("TEXTURE_FILL_CHROMA_MIN", 0.15)),
+            )
         if torch.is_tensor(reg):
             loss = loss + reg.to(loss)
 
@@ -594,7 +719,8 @@ class SphereEscher:
         # the step rate collapsed from 0.54 to over 2.3 s. Separate backwards accumulate
         # into the same .grad buffers, so the result is identical and the first graph is
         # freed before the second is built.
-        loss.backward()
+        with self.timer.phase("backward"):
+            loss.backward()
         total_loss = float(loss.detach())
 
         sil = 0.0
@@ -605,23 +731,33 @@ class SphereEscher:
             and not frozen
         )
         if use_silhouette:
-            sil_loss = a.SILHOUETTE_WEIGHT * self.silhouette_loss(a.SILHOUETTE_BATCH_SIZE)
-            sil_loss.backward()
+            with self.timer.phase("backward"):
+                sil_loss = a.SILHOUETTE_WEIGHT * self.silhouette_loss(
+                    a.SILHOUETTE_BATCH_SIZE
+                )
+                sil_loss.backward()
             sil = float(sil_loss.detach())
             total_loss += sil
 
-        if frozen:
-            self.apply_shape_freeze()
+        with self.timer.phase("opt"):
+            if frozen:
+                self.apply_shape_freeze()
 
-        self.optimizer.step()
+            self.optimizer.step()
 
-        areas = np.abs(signed_solid_angles(points.detach().cpu().numpy(), self.mesh.faces))
-        area_spread = float(np.percentile(areas, 99) / max(np.percentile(areas, 1), 1e-30))
+        with self.timer.phase("stats"):
+            areas = np.abs(
+                signed_solid_angles(points.detach().cpu().numpy(), self.mesh.faces)
+            )
+            area_spread = float(
+                np.percentile(areas, 99) / max(np.percentile(areas, 1), 1e-30)
+            )
 
-        self._last_info = {
-            "boundary_ratio": self.boundary_ratio(points),
-            "area_spread": area_spread,
-        }
+            self._last_info = {
+                "boundary_ratio": self.boundary_ratio(points),
+                "area_spread": area_spread,
+            }
+        self.timer.tick()
         return {
             "loss": total_loss,
             "silhouette": sil,
@@ -632,15 +768,51 @@ class SphereEscher:
             "area_spread": area_spread,
             "frozen_at": self._frozen_at,
             "timestep": float(timestep.float().mean()),
-            "energy": self.embedder.last_result.energy,
-            "solver_iters": (
-                self.embedder.last_result.stage1.n_iter
-                + self.embedder.last_result.stage2.n_iter
-            ),
+            "energy": energy,
+            "solver_iters": solver_iters,
             "points": points,
         }
 
     # ------------------------------------------------------------------- diagnostics
+    TIMING_PHASES = (
+        "solve",
+        "render",
+        "sds",
+        "backward",
+        "opt",
+        "stats",
+        "geom_check",
+        "snapshot",
+        "checkpoint",
+    )
+
+    @property
+    def timer(self) -> PhaseTimer:
+        """Lazy so the ``__new__``-built paths (shape phase, render_final) get one too."""
+        t = getattr(self, "_timer", None)
+        if t is None:
+            t = PhaseTimer(
+                enabled=bool(self.args.get("TIMING", False)),
+                cuda_sync=self.device.type == "cuda",
+            )
+            self._timer = t
+        return t
+
+    def log_timing(self, iteration: int) -> None:
+        """One row of per-phase mean ms/step over the window since the last row."""
+        path = self.output_dir / "timing.csv"
+        new = not path.exists()
+        means = self.timer.means_ms(self.TIMING_PHASES)
+        with open(path, "a", encoding="utf-8") as f:
+            if new:
+                f.write("step," + ",".join(self.TIMING_PHASES) + ",total_ms\n")
+            f.write(
+                f"{iteration},"
+                + ",".join(f"{m:.1f}" for m in means)
+                + f",{sum(means):.1f}\n"
+            )
+        self.timer.reset()
+
     def boundary_ratio(self, points: torch.Tensor) -> float:
         """Tile perimeter relative to the undeformed lune -- see
         :func:`~escher.geometry.spherical_sanity_checks.boundary_arc_ratio`."""
@@ -650,16 +822,17 @@ class SphereEscher:
             tuple(self.mesh.boundary_chains),
         )
 
-    def log_metrics(self, iteration: int, info: dict) -> None:
-        """Append one row to ``metrics.csv``.
+    def log_metrics(self, iteration: int, info: dict, fresh: bool = False) -> None:
+        """Append one row to ``metrics.csv``; ``fresh`` truncates first.
 
         Written by the process itself rather than scraped from stdout: a previous run's log
         was piped through a tail-only filter at launch and the history was lost, taking the
-        matched-step comparison with it.
+        matched-step comparison with it. A from-scratch run into an existing dir used to
+        CONCATENATE two histories with no separator; an in-place resume still appends.
         """
         path = self.output_dir / "metrics.csv"
-        new = not path.exists()
-        with open(path, "a", encoding="utf-8") as f:
+        new = fresh or not path.exists()
+        with open(path, "w" if fresh else "a", encoding="utf-8") as f:
             if new:
                 f.write(
                     "step,loss,silhouette,area_reg,karcher,"
@@ -700,6 +873,15 @@ class SphereEscher:
         tagged = self.output_dir / f"checkpoint_{iteration:06d}.pt"
         torch.save(payload, tagged)
         torch.save(payload, self.output_dir / "checkpoint.pt")
+        # Retention: keep the newest KEEP_CHECKPOINTS tagged files (-1 = all, the
+        # historical behavior). checkpoint.pt always survives. A 64-candidate
+        # screen was writing ~400 MB of tagged checkpoints nothing ever read.
+        keep = int(self.args.get("KEEP_CHECKPOINTS", -1))
+        if keep >= 0:
+            tagged_all = sorted(self.output_dir.glob("checkpoint_*.pt"))
+            drop = tagged_all[:-keep] if keep > 0 else tagged_all
+            for old in drop:
+                old.unlink(missing_ok=True)
         return tagged
 
     def load_checkpoint(self, path: str | Path, reset_texture: bool = False) -> int:
@@ -717,6 +899,9 @@ class SphereEscher:
             if not reset_texture:
                 self.texture.copy_(state["texture"].to(self.device))
         self.optimizer.load_state_dict(state["optimizer"])
+        # The loaded parameters need a fresh solve; a cache from before the load
+        # would render the OLD shape forever.
+        self._frozen_cache = None
         return int(state["iteration"])
 
     def save_snapshot(self, iteration: int) -> None:
@@ -769,36 +954,57 @@ class SphereEscher:
         plt.close(fig)
 
     # -------------------------------------------------------------------------- loop
-    def run(self, resume_from: str | Path | None = None) -> None:
+    def run(
+        self,
+        resume_from: str | Path | None = None,
+        start_step: int | None = None,
+    ) -> None:
         """Optimise. With ``resume_from``, continue an interrupted run in place.
 
         Long runs are ~1 hour, so losing one to an interruption is expensive; checkpoints
         were already being written every ``VISUALIZATION_FREQ`` steps but nothing consumed
         them.
+
+        ``start_step`` overrides the checkpoint's step counter -- the cross-phase
+        handoff (shape checkpoint at 1500 into a texture run) needs to start its OWN
+        schedule at 0, and without the override a shape checkpoint at or past
+        N_STEPS silently no-opped. A no-op resume is now an error (exit 5), never a
+        silent success.
         """
         a = self.args
         first_step = 0
         if resume_from is not None:
-            first_step = (
-                self.load_checkpoint(
-                    resume_from,
-                    reset_texture=a.get("RESET_TEXTURE_ON_RESUME", False),
-                )
-                + 1
+            loaded = self.load_checkpoint(
+                resume_from,
+                reset_texture=a.get("RESET_TEXTURE_ON_RESUME", False),
             )
-            print(f"resuming from {resume_from} at step {first_step}")
+            first_step = loaded + 1 if start_step is None else int(start_step)
+            print(
+                f"resuming from {resume_from} (checkpoint step {loaded}) "
+                f"at step {first_step}"
+            )
             if first_step >= a.N_STEPS:
-                print("checkpoint is already at or past N_STEPS; nothing to do")
-                return
+                raise SystemExit(5)
 
         start = time.time()
+        last_print = (start, first_step)
+        first_log = True
         for iteration in range(first_step, a.N_STEPS + 1):
             info = self.step(iteration)
 
             if iteration % 10 == 0:
-                self.log_metrics(iteration, info)
-                elapsed = time.time() - start
-                per_step = elapsed / max(iteration - first_step, 1)
+                # Truncate only when this run STARTS the history (step 0); an
+                # in-place resume keeps appending to its own file.
+                self.log_metrics(iteration, info, fresh=first_log and first_step == 0)
+                first_log = False
+                if self.timer.enabled:
+                    self.log_timing(iteration)
+                now = time.time()
+                per_step = (now - start) / max(iteration - first_step, 1)
+                # Instantaneous (since the last print) next to cumulative: the
+                # cumulative average buries a mid-run slowdown for thousands of steps.
+                inst = (now - last_print[0]) / max(iteration - last_print[1], 1)
+                last_print = (now, iteration)
                 mem = torch.cuda.max_memory_allocated() / 2**30
                 print(
                     f"step {iteration:5d} | loss {info['loss']:9.1f} | "
@@ -808,16 +1014,39 @@ class SphereEscher:
                     f"spread {info['area_spread']:6.1f} | "
                     f"flp {info['flips']:2d}/{info['reverts']:3d} | "
                     f"solver {info['solver_iters']:3d} it | "
-                    f"{per_step:5.2f} s/step | {mem:4.1f} GiB",
+                    f"{inst:5.2f}/{per_step:5.2f} s/step | {mem:4.1f} GiB",
                     flush=True,
                 )
 
             if iteration % a.VISUALIZATION_FREQ == 0:
-                ok, message = self.check_geometry(info["points"])
+                with self.timer.phase("geom_check"):
+                    ok, message = self.check_geometry(info["points"])
                 if not ok:
                     print(f"  !! geometry check failed: {message}")
-                self.save_snapshot(iteration)
-                self.save_checkpoint(iteration)
+                with self.timer.phase("checkpoint"):
+                    self.save_checkpoint(iteration)
+            # Snapshots (2 renders + a matplotlib figure) can be decoupled from the
+            # checkpoint/geometry cadence; default null keeps them in lockstep.
+            snap_freq = int(a.get("SNAPSHOT_FREQ") or a.VISUALIZATION_FREQ)
+            if iteration % snap_freq == 0:
+                with self.timer.phase("snapshot"):
+                    self.save_snapshot(iteration)
+
+            # Optional in-training gutter fill: refresh the never-rasterized texels
+            # with their nearest sampled color so minified (mip) taps average
+            # figure colors, not the init flat. no_grad, valid texels untouched.
+            gutter_every = int(a.get("TEXTURE_GUTTER_FILL_EVERY", 0) or 0)
+            if gutter_every > 0 and iteration % gutter_every == 0:
+                from escher.rendering.texture_mask import gutter_fill
+
+                valid = self.texture_valid_mask().cpu().numpy()
+                with torch.no_grad():
+                    filled = gutter_fill(
+                        self.texture.detach().cpu().numpy(), valid
+                    )
+                    self.texture.data.copy_(
+                        torch.as_tensor(filled, device=self.device)
+                    )
 
         self.save_checkpoint(a.N_STEPS)
         print(f"\ndone in {(time.time() - start) / 60:.1f} min -> {self.output_dir}")
@@ -846,7 +1075,11 @@ def load_sphere_args(cli):
 def main() -> None:
     cli = OmegaConf.from_cli()
     resume = cli.pop("RESUME", None)
-    SphereEscher(load_sphere_args(cli)).run(resume_from=resume)
+    start_step = cli.pop("START_STEP", None)
+    SphereEscher(load_sphere_args(cli)).run(
+        resume_from=resume,
+        start_step=None if start_step is None else int(start_step),
+    )
 
 
 if __name__ == "__main__":
