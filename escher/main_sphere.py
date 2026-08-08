@@ -73,12 +73,27 @@ def texture_tv(texture: torch.Tensor) -> torch.Tensor:
 from escher.guidance.schedule import annealed_max_step, arm_sds  # noqa: E402,F401
 
 
+def apply_backend_flags(args) -> None:
+    """Opt-in GPU backend toggles, all default OFF.
+
+    Each changes kernel/algorithm selection, so runs are statistically -- not
+    bitwise -- comparable with them on. cudnn.benchmark is the natural fit here:
+    every conv shape in the loop is static (4x512^2 VAE, batch-8 64^2 UNet).
+    """
+    if bool(args.get("CUDNN_BENCHMARK", False)):
+        torch.backends.cudnn.benchmark = True
+    if bool(args.get("ALLOW_TF32", False)):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
 class SphereEscher:
     """Optimises a spherical Escher tiling against a text prompt."""
 
     def __init__(self, args):
         self.args = args
         self.device = torch.device(args.DEVICE)
+        apply_backend_flags(args)
         torch.manual_seed(args.SEED)
         np.random.seed(args.SEED)
 
@@ -223,6 +238,8 @@ class SphereEscher:
             guidance_scale=a.GUIDANCE_SCALE,
             half_precision_weights=a.USE_HALF_PRECISION,
             grad_clip=[0, 2.0, 8.0, 1000] if a.CLIP_GRADIENTS_IN_SDS else None,
+            enable_channels_last_format=bool(a.get("CHANNELS_LAST", False)),
+            torch_compile=bool(a.get("TORCH_COMPILE", False)),
         )
         self.guidance = sd.StableDiffusion(cfg)
         # The silhouette pass shows the model a flat solid shape, so it gets a prompt that

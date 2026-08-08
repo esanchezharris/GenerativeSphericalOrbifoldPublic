@@ -188,3 +188,17 @@ TIMING: false
 # run bit-identically; "cuda" is a different rasterizer implementation (edge pixels
 # may differ at exact coverage ties) -- opt-in A/B only.
 RASTER_CONTEXT: "gl"
+
+### GPU backend toggles -- all opt-in; each changes kernel/algorithm selection, so
+### runs are statistically (not bitwise) comparable with them on. Measured on the
+### 60-step timing probe before changing any default.
+# cudnn autotune; every conv shape in the loop is static, the classic best case.
+CUDNN_BENCHMARK: false
+# TF32 matmul/conv for float32 GPU work (the diffusion stack is fp16; this touches
+# only the float32 remainder).
+ALLOW_TF32: false
+# NHWC memory format for the UNet.
+CHANNELS_LAST: false
+# torch.compile the UNet + VAE encoder. First step pays a minutes-long compile;
+# only sensible for full-length texture runs.
+TORCH_COMPILE: false

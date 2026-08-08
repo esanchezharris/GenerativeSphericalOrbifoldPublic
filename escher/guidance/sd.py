@@ -70,6 +70,13 @@ class Config:
     token_merging: bool = False
     token_merging_params: Optional[dict] = field(default_factory=dict)
 
+    # torch.compile the UNet and the VAE encoder (the only two networks on the SDS
+    # hot path -- the UNet runs once per step under no_grad, the VAE encoder is the
+    # sole network in the backward). First call pays a minutes-long compile; only
+    # worth it for full-length runs. vae.encoder is compiled (not vae) because
+    # AutoencoderKL.encode calls self.encoder directly, bypassing a wrapped forward.
+    torch_compile: bool = False
+
 
 class StableDiffusion(nn.Module):
     def __init__(self, cfg: Config = Config()):
@@ -133,6 +140,10 @@ class StableDiffusion(nn.Module):
             import tomesd
 
             tomesd.apply_patch(self.unet, **self.cfg.token_merging_params)
+
+        if self.cfg.torch_compile:
+            self.unet = torch.compile(self.unet)
+            self.vae.encoder = torch.compile(self.vae.encoder)
 
         if self.cfg.use_sjc:
             # score jacobian chaining use DDPM
