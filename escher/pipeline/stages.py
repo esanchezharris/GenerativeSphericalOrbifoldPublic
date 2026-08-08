@@ -74,6 +74,7 @@ def _shape_extra(plan: JobPlan) -> dict:
 
 
 def screen_params(plan: JobPlan, dry_run: bool) -> dict:
+    over = dict(plan.stages.get("screen") or {})
     extra = {
         **_shape_extra(plan),
         "SWEEP_TARGETS": True,
@@ -81,8 +82,9 @@ def screen_params(plan: JobPlan, dry_run: bool) -> dict:
         "WINNER_OUT": str(plan.winner_path),
         "OUTPUT_DIR": str(plan.root / "screen" / "cand"),
         # Screens run on the CPU lane so they can overlap a texture run that
-        # owns the GPU exclusively.
-        "TARGET_SWEEP_DEVICE": "cpu",
+        # owns the GPU exclusively; a stage override can reclaim the GPU when
+        # the batch has no concurrent texture work.
+        "TARGET_SWEEP_DEVICE": over.get("TARGET_SWEEP_DEVICE", "cpu"),
     }
     args = _merged(
         ["configs/sphere.yaml", "configs/sphere_shape.yaml"],
@@ -93,6 +95,7 @@ def screen_params(plan: JobPlan, dry_run: bool) -> dict:
 
 
 def carve_params(plan: JobPlan, seed: int, dry_run: bool) -> dict:
+    over = dict(plan.stages.get("carve") or {})
     extra = {
         **_shape_extra(plan),
         "SWEEP_TARGETS": False,
@@ -100,7 +103,9 @@ def carve_params(plan: JobPlan, seed: int, dry_run: bool) -> dict:
         "TARGET_MASK": str(plan.winner_path),
         "OUTPUT_DIR": str(plan.carve_dir(seed)),
         "SEED": int(seed),
-        "DEVICE": "cpu",  # CPU lane; carve on GPU only when the lane owns it
+        # CPU lane default (a texture run may own the GPU); ~13x slower than GPU,
+        # so a stage override can reclaim cuda when nothing else is running.
+        "DEVICE": over.get("DEVICE", "cpu"),
     }
     args = _merged(
         ["configs/sphere.yaml", "configs/sphere_shape.yaml"],

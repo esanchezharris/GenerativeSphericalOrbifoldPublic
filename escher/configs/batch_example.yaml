@@ -20,15 +20,10 @@ defaults:
       N: 16
       STEPS: 30
     screen:
-      CONF_FILE: [configs/sphere_shape_weights.yaml]
-      COTANGENT_RELATIVE_WEIGHTS: true
-      SHAPE_CAMERA_DISTANCE: 2.4
+      CONF_FILE: [configs/sphere_shape_weights_fish2.yaml]
       TARGET_SWEEP_STEPS: 150
-      SWEEP_RANK_METRIC: "hard"
     carve:
-      CONF_FILE: [configs/sphere_shape_weights.yaml]
-      COTANGENT_RELATIVE_WEIGHTS: true
-      SHAPE_CAMERA_DISTANCE: 2.4
+      CONF_FILE: [configs/sphere_shape_weights_fish2.yaml]
       SHAPE_STEPS: 1500
       KEEP_CHECKPOINTS: 2
     texture:
