@@ -43,6 +43,18 @@ SHAPE_RENDER_SIZE: null
 SHAPE_CAMERA_FOV: null
 MIN_FRAME_MARGIN_PX: 0
 
+# Area-match measure. Pixel counts are not steradians: per-pixel spherical area
+# varies 2.4x across the tile at the production framing, so a pixel-matched target
+# is 1.032x the tile's PINNED 4pi/|G| -- a structural hard-IoU ceiling of ~0.95
+# before optimization starts. true matches the target to the tile in steradians
+# (escher/pixel_solid_angle.py). The achieved-area bisection that fixes the
+# compute-scale-then-crop bug (shipped fish target delivered 1.9% short) is
+# unconditional either way.
+SOLID_ANGLE_AREA_MATCH: false
+# Weight the finest mask-loss level by per-pixel solid angle too, so the optimizer
+# values coverage per steradian. Experimental; A/B separately from the alignment.
+SOLID_ANGLE_LOSS_WEIGHTING: false
+
 # Non-empty (e.g. [4, 6]) runs one shape fit per k into OUTPUT_DIR_k<k> and picks the
 # winner by IoU among certificate-valid runs.
 SWEEP_K: []

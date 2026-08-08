@@ -64,6 +64,8 @@ class ShapeContext:
     loop: torch.Tensor  # ordered boundary vertex indices
     size: int
     tau: float
+    # Per-pixel solid angles for SOLID_ANGLE_LOSS_WEIGHTING; None = unweighted.
+    loss_weights: torch.Tensor | None = None
 
 
 def build_shape_run(args) -> SphereEscher:
@@ -173,12 +175,22 @@ def prepare_target(escher: SphereEscher, ctx: ShapeContext, args) -> torch.Tenso
     with torch.no_grad():
         alpha0 = soft_alpha(escher, escher.solve_points(), ctx)[0, ..., 0].cpu().numpy()
 
+    weights = None
+    if bool(args.get("SOLID_ANGLE_AREA_MATCH", False)):
+        from escher.pixel_solid_angle import pixel_solid_angles
+
+        weights = pixel_solid_angles(ctx.mv, ctx.proj, ctx.size, ctx.size)
+
     aligned, params, iou = align_mask_to(
-        alpha0, raw, match_area=bool(args.get("MATCH_TILE_AREA", True))
+        alpha0,
+        raw,
+        match_area=bool(args.get("MATCH_TILE_AREA", True)),
+        pixel_weights=weights,
     )
     print(
         f"target aligned: scale {params['scale']:.3f}, angle {params['angle_deg']:+.1f} deg, "
-        f"initial IoU {iou:.3f}"
+        f"initial IoU {iou:.3f}, area ratio {params['area_ratio']:.4f} "
+        f"({params['area_measure']})"
     )
 
     import imageio.v2 as imageio
@@ -208,7 +220,7 @@ def shape_step(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, ar
 
     alpha = soft_alpha(escher, points, ctx)
     mask = args.MASK_LOSS_WEIGHT * mask_pyramid_loss(
-        alpha, target, levels=args.MASK_PYRAMID_LEVELS
+        alpha, target, levels=args.MASK_PYRAMID_LEVELS, pixel_weights=ctx.loss_weights
     )
 
     reg = points.new_zeros(())
@@ -283,7 +295,7 @@ def evaluate_shape(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext
         points, flips, _ = escher.ensure_valid_shape()
         alpha = soft_alpha(escher, points, ctx)
         mask = args.MASK_LOSS_WEIGHT * mask_pyramid_loss(
-            alpha, target, levels=args.MASK_PYRAMID_LEVELS
+            alpha, target, levels=args.MASK_PYRAMID_LEVELS, pixel_weights=ctx.loss_weights
         )
     areas = np.abs(signed_solid_angles(points.detach().cpu().numpy(), escher.mesh.faces))
     return {
@@ -390,6 +402,15 @@ def run_shape(args) -> dict:
         print(
             "  !! boundary vertices start OUTSIDE the frame -- the loss and metric "
             "cannot see them; fix the framing before trusting any number from this run"
+        )
+
+    if bool(args.get("SOLID_ANGLE_LOSS_WEIGHTING", False)):
+        from escher.pixel_solid_angle import pixel_solid_angles
+
+        ctx.loss_weights = torch.as_tensor(
+            pixel_solid_angles(ctx.mv, ctx.proj, ctx.size, ctx.size),
+            dtype=torch.float32,
+            device=escher.device,
         )
 
     target = prepare_target(escher, ctx, args)
