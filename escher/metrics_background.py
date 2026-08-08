@@ -58,8 +58,24 @@ def measure(
     n_views: int = 30,
     tint: bool = True,
     audit_views: int = 4,
+    gutter: bool = True,
 ) -> dict:
     escher, iteration = load_run(checkpoint)
+
+    # Measure what the deliverable renders: render_final gutter-fills the
+    # unsampled texels by default, so the gate does too (GUTTER=0 to measure the
+    # raw checkpoint -- that is what the 3.078% shipped baseline was).
+    if gutter:
+        from escher.rendering.texture_mask import gutter_fill, uv_valid_mask
+
+        valid = uv_valid_mask(
+            escher.mesh.uv, escher.mesh.faces, int(escher.args.TEXTURE_RESOLUTION)
+        )
+        with torch.no_grad():
+            filled = gutter_fill(escher.texture.detach().cpu().numpy(), valid)
+            escher.texture.data.copy_(
+                torch.as_tensor(filled, device=escher.texture.device)
+            )
 
     tint_mtx = None
     if tint:
@@ -127,6 +143,7 @@ def measure(
         "iteration": iteration,
         "n_views": n_views,
         "tinted": bool(tint),
+        "gutter_filled": bool(gutter),
         "thresholds": {
             "chroma_max": CHROMA_MAX,
             "luma_min": LUMA_MIN,
@@ -176,12 +193,15 @@ def main() -> None:
     checkpoint = Path(sys.argv[1])
     n_views = 30
     tint = True
+    gutter = True
     for arg in sys.argv[2:]:
         if arg.startswith("N_VIEWS="):
             n_views = int(arg.split("=", 1)[1])
         elif arg == "TINT=0":
             tint = False
-    measure(checkpoint, n_views=n_views, tint=tint)
+        elif arg == "GUTTER=0":
+            gutter = False
+    measure(checkpoint, n_views=n_views, tint=tint, gutter=gutter)
 
 
 if __name__ == "__main__":

@@ -182,6 +182,17 @@ SNAPSHOT_FREQ: null
 # Keep only the newest N step-tagged checkpoints (-1 = keep all, historical).
 # checkpoint.pt (the latest) always survives.
 KEEP_CHECKPOINTS: -1
+
+### zero-background texture levers (all default off; see escher/rendering/texture_mask.py)
+# Chroma floor on the sampled texels: the per-tile hue tint is a rotation about the
+# RGB gray axis, so achromatic (white/gray) paint renders identically in EVERY tile
+# and reads as one continuous background field. Weight ~10-50 against TV's 100.
+TEXTURE_FILL_WEIGHT: 0.0
+TEXTURE_FILL_CHROMA_MIN: 0.15
+# Every N steps, refill the never-rasterized ~60% of texels with their nearest
+# sampled color (mip-leak fix during training; render_final always fills at export
+# unless GUTTER=0). 0 = off.
+TEXTURE_GUTTER_FILL_EVERY: 0
 DEVICE: "cuda"
 # Per-phase timing breakdown (escher/misc/timing.py) -> timing.csv beside metrics.csv.
 # Inserts cuda synchronize at phase boundaries, which itself slows the loop -- enable

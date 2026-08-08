@@ -134,17 +134,34 @@ def finalize(
     shade: bool = True,
     out_dir: str | Path | None = None,
     turntable: bool = True,
+    gutter: bool = True,
 ) -> dict:
     """Turn a finished checkpoint into deliverables; callable by a driver.
 
     ``tint=None`` keeps the run config's TILE_TINT choice; ``out_dir=None`` writes
     beside the checkpoint (historical behavior); ``turntable=False`` skips the
     nvdiffrast video (export_mesh is CPU-safe, which is what dry runs use).
-    Returns artifact paths plus ``geometry_ok`` -- the 4pi certificate.
+    ``gutter`` fills the never-rasterized ~60% of texels with their nearest
+    sampled color before rendering, so the mip chain stops leaking the flat init
+    color into minified views (measured 1.17% of sphere pixels on the shipped
+    fish). Returns artifact paths plus ``geometry_ok`` -- the 4pi certificate.
     """
     checkpoint = Path(checkpoint)
     escher, iteration = load_run(checkpoint)
     print(f"loaded step {iteration} from {checkpoint}")
+
+    if gutter:
+        from escher.rendering.texture_mask import gutter_fill, uv_valid_mask
+
+        valid = uv_valid_mask(
+            escher.mesh.uv, escher.mesh.faces, int(escher.args.TEXTURE_RESOLUTION)
+        )
+        with torch.no_grad():
+            filled = gutter_fill(escher.texture.detach().cpu().numpy(), valid)
+            escher.texture.data.copy_(
+                torch.as_tensor(filled, device=escher.texture.device)
+            )
+        print(f"gutter-filled {int((~valid).sum())} unsampled texels")
 
     # Per-tile hue rotation (the alternating-color Escher look) is a render-time
     # choice. The OBJ export stays untinted either way -- one shared texture is the
@@ -182,11 +199,14 @@ def finalize(
 
 def main() -> None:
     if len(sys.argv) < 2:
-        raise SystemExit(f"usage: {sys.argv[0]} <checkpoint.pt> [TINT=1] [SHADE=0]")
+        raise SystemExit(
+            f"usage: {sys.argv[0]} <checkpoint.pt> [TINT=1] [SHADE=0] [GUTTER=0]"
+        )
     result = finalize(
         Path(sys.argv[1]),
         tint=True if "TINT=1" in sys.argv[2:] else None,
         shade="SHADE=0" not in sys.argv[2:],
+        gutter="GUTTER=0" not in sys.argv[2:],
     )
     if not result["geometry_ok"]:
         raise SystemExit(3)

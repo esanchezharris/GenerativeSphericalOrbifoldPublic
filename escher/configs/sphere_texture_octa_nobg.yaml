@@ -1,0 +1,20 @@
+# Zero-background overlay -- list THIRD, after sphere_texture.yaml and
+# sphere_texture_octa.yaml, which stay byte-identical for reproducing the shipped
+# fish:
+#
+#   python escher/main_sphere.py "CONF_FILE=[configs/sphere_texture.yaml,configs/sphere_texture_octa.yaml,configs/sphere_texture_octa_nobg.yaml]" ...
+#
+# Attacks the measured background sources on the shipped sphere (bg_frac 3.078%:
+# 1.91% white-like SDS negative space + 1.17% init-tan mip leak):
+#  - the prompt now REQUESTS edge-to-edge coverage and the negative prompt bans
+#    empty space (the old negative banned only a *cluttered* background);
+#  - a chroma floor keeps every sampled texel recolorable by the tile tint
+#    (achromatic pixels are fixed points of the hue rotation);
+#  - periodic gutter fill keeps unsampled texels at figure colors for the mips.
+
+PROMPT: "a fish with scales and fins, flat vector illustration, solid pastel colors, simple shapes, the fish fills the entire frame edge to edge, a masterpiece"
+NEGATIVE_PROMPT: "noisy, grainy, photorealistic, 3d render, blurry, cluttered background, white background, plain background, empty space, negative space, border, margin, knitted, yarn, fabric, woven texture"
+
+TEXTURE_FILL_WEIGHT: 25.0
+TEXTURE_FILL_CHROMA_MIN: 0.15
+TEXTURE_GUTTER_FILL_EVERY: 50

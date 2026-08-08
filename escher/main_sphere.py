@@ -68,6 +68,30 @@ def texture_tv(texture: torch.Tensor) -> torch.Tensor:
     return dx.square().mean() + dy.square().mean()
 
 
+def texture_fill_loss(
+    texture: torch.Tensor, valid: torch.Tensor, chroma_min: float
+) -> torch.Tensor:
+    """Chroma floor on the sampled texels: no pixel of the tile may read as background.
+
+    Root-cause fix for the tint-invariant filler: the per-tile hue rotation is a
+    rotation about the RGB gray axis, so ACHROMATIC pixels are exact fixed points --
+    white/gray paint renders identically in all 24 tiles and reads as one continuous
+    background field, defeating the 3-coloring that makes the tiling legible. A
+    floor on chroma (max-min over RGB) guarantees every rasterized texel
+    participates in the palette alternation. Quadratic shortfall, mean over the
+    VALID (actually sampled) texels only.
+
+    Known flat spot: an EXACTLY equal RGB triple has zero gradient (max and min
+    route to the same channel -- true of any symmetric chroma measure). Harmless
+    in training: the init color is chromatic tan and per-step SDS noise breaks
+    channel ties immediately; the offline polish scrub covers any texel that
+    somehow stays pinned there.
+    """
+    chroma = texture.max(dim=-1).values - texture.min(dim=-1).values
+    shortfall = (chroma_min - chroma).clamp_min(0.0)
+    return shortfall[valid].square().mean()
+
+
 # Shared with the planar pipeline; re-exported here because tests and older call sites
 # import them from main_sphere.
 from escher.guidance.schedule import annealed_max_step, arm_sds  # noqa: E402,F401
@@ -357,6 +381,21 @@ class SphereEscher:
         if self.args.PARAM_MODE == "boundary":
             return self.embedder(self.b_orb.boundary_b(self.P))
         return self.embedder(self.edge_weights())
+
+    def texture_valid_mask(self) -> torch.Tensor:
+        """Bool ``(R, R)`` of texels the mesh actually samples, cached."""
+        mask = getattr(self, "_tex_valid_mask", None)
+        if mask is None:
+            from escher.rendering.texture_mask import uv_valid_mask
+
+            mask = torch.as_tensor(
+                uv_valid_mask(
+                    self.mesh.uv, self.mesh.faces, int(self.args.TEXTURE_RESOLUTION)
+                ),
+                device=self.device,
+            )
+            self._tex_valid_mask = mask
+        return mask
 
     def _frozen_solve(self) -> dict:
         """Solve ONCE at the freeze latch; reuse the detached result afterwards.
@@ -663,6 +702,13 @@ class SphereEscher:
         tv_w = a.get("TEXTURE_TV_WEIGHT", 0.0)
         if tv_w > 0:
             loss = loss + tv_w * texture_tv(self.texture)
+        fill_w = a.get("TEXTURE_FILL_WEIGHT", 0.0)
+        if fill_w and fill_w > 0:
+            loss = loss + fill_w * texture_fill_loss(
+                self.texture,
+                self.texture_valid_mask(),
+                float(a.get("TEXTURE_FILL_CHROMA_MIN", 0.15)),
+            )
         if torch.is_tensor(reg):
             loss = loss + reg.to(loss)
 
@@ -985,6 +1031,22 @@ class SphereEscher:
             if iteration % snap_freq == 0:
                 with self.timer.phase("snapshot"):
                     self.save_snapshot(iteration)
+
+            # Optional in-training gutter fill: refresh the never-rasterized texels
+            # with their nearest sampled color so minified (mip) taps average
+            # figure colors, not the init flat. no_grad, valid texels untouched.
+            gutter_every = int(a.get("TEXTURE_GUTTER_FILL_EVERY", 0) or 0)
+            if gutter_every > 0 and iteration % gutter_every == 0:
+                from escher.rendering.texture_mask import gutter_fill
+
+                valid = self.texture_valid_mask().cpu().numpy()
+                with torch.no_grad():
+                    filled = gutter_fill(
+                        self.texture.detach().cpu().numpy(), valid
+                    )
+                    self.texture.data.copy_(
+                        torch.as_tensor(filled, device=self.device)
+                    )
 
         self.save_checkpoint(a.N_STEPS)
         print(f"\ndone in {(time.time() - start) / 60:.1f} min -> {self.output_dir}")
