@@ -141,6 +141,10 @@ def align_mask_to(
     angles_deg: tuple[float, float, int] = (-180.0, 180.0, 49),
     match_area: bool = False,
     pixel_weights: np.ndarray | None = None,
+    corner_px: np.ndarray | None = None,
+    corner_weight: float = 0.0,
+    translation_px: float = 0.0,
+    translation_steps: int = 5,
 ) -> tuple[np.ndarray, dict, float]:
     """Place ``target`` over ``reference`` by a similarity transform, maximizing IoU.
 
@@ -168,8 +172,19 @@ def align_mask_to(
     actually lives in -- instead of pixels (2.4x per-pixel spread at the production
     framing, a structural hard-IoU ceiling of ~0.95).
 
+    ``corner_px`` (``(4, 2)`` pixel positions, col/row) are the tile's PINNED cone
+    corners: four outline points the carve can never move. A corner outside the
+    figure is a guaranteed permanent filler spike (the shipped fish had all four
+    outside), so with ``corner_weight`` > 0 candidates are scored by
+    ``iou - corner_weight * mean(dist_outside(corner)) / r_ref`` -- trading a
+    little raw step-0 IoU for residual the optimizer can actually remove.
+    ``translation_px`` > 0 additionally searches an offset grid around the
+    centroid-derived placement (on the best rotations only; the centroid is a
+    moment, not an optimum). Both apply to the ``match_area`` path.
+
     Returns ``(aligned_mask, params, best_iou)``; ``params`` records scale,
-    angle_deg, shift, achieved ``area_ratio`` and the ``area_measure`` used.
+    angle_deg, shift, achieved ``area_ratio``/``area_measure``, and per-corner
+    outside distances (``corner_dist_px``) when corners were given.
     """
     ref = np.asarray(reference, dtype=np.float64)
     tgt = np.asarray(target, dtype=np.float64)
@@ -183,7 +198,7 @@ def align_mask_to(
         inside = m > 0.5
         return float(inside.sum()) if weights is None else float(weights[inside].sum())
 
-    def place(s: float, angle: float) -> np.ndarray:
+    def place(s: float, angle: float, delta: np.ndarray | None = None) -> np.ndarray:
         theta = np.deg2rad(angle)
         rot = np.array(
             [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]]
@@ -191,15 +206,31 @@ def align_mask_to(
         # scipy's affine_transform pulls: output[y] = input[M @ y + offset], so M is
         # the INVERSE map (reference frame -> target frame).
         M = rot.T / s
-        offset = c_tgt - M @ c_ref
+        anchor = c_ref if delta is None else c_ref + delta
+        offset = c_tgt - M @ anchor
         return ndimage.affine_transform(
             tgt, M, offset=offset, output_shape=ref.shape, order=0, cval=0.0
         )
 
+    corners = None if corner_px is None else np.asarray(corner_px, dtype=np.float64)
+
+    def score(aligned: np.ndarray) -> tuple[float, float, np.ndarray | None]:
+        """(ranking score, plain IoU, per-corner outside distance px)."""
+        iou = _hard_iou(aligned, ref)
+        if corners is None or corner_weight <= 0.0:
+            return iou, iou, None
+        inside = aligned > 0.5
+        dt = ndimage.distance_transform_edt(~inside)
+        rows = np.clip(np.round(corners[:, 1]).astype(int), 0, ref.shape[0] - 1)
+        cols = np.clip(np.round(corners[:, 0]).astype(int), 0, ref.shape[1] - 1)
+        dists = dt[rows, cols]
+        return iou - corner_weight * float(dists.mean()) / max(r_ref, 1e-9), iou, dists
+
     ref_area = masked_area(ref)
-    best = (None, None, -1.0)
+    best = (-2.0, -1.0, None, None, None)  # score, iou, aligned, params, dists
     if match_area:
         s_est = float(np.sqrt((ref > 0.5).sum() / max((tgt > 0.5).sum(), 1)))
+        stage1 = []
         for angle in np.linspace(*angles_deg):
             lo, hi = 0.5 * s_est, 2.0 * s_est
             while masked_area(place(hi, angle)) < ref_area and hi < 4.0 * s_est:
@@ -212,22 +243,46 @@ def align_mask_to(
                 else:
                     hi = s
             aligned = place(s, angle)
-            iou = _hard_iou(aligned, ref)
-            if iou > best[2]:
-                best = (aligned, {"scale": s, "angle_deg": float(angle)}, iou)
+            sc, iou, dists = score(aligned)
+            stage1.append((sc, float(s), float(angle)))
+            if sc > best[0]:
+                best = (sc, iou, aligned, {"scale": s, "angle_deg": float(angle)}, dists)
+
+        if translation_px > 0:
+            # Offset grid on the best rotations only; the scale from stage 1 is kept
+            # (a few-px shift barely changes the achieved area).
+            stage1.sort(key=lambda c: -c[0])
+            offsets = np.linspace(-translation_px, translation_px, int(translation_steps))
+            for _, s, angle in stage1[:5]:
+                for dy in offsets:
+                    for dx in offsets:
+                        if dy == 0.0 and dx == 0.0:
+                            continue
+                        aligned = place(s, angle, delta=np.array([dy, dx]))
+                        sc, iou, dists = score(aligned)
+                        if sc > best[0]:
+                            best = (
+                                sc,
+                                iou,
+                                aligned,
+                                {"scale": s, "angle_deg": angle, "delta_px": (dy, dx)},
+                                dists,
+                            )
     else:
         for mult in np.linspace(*scales):
             for angle in np.linspace(*angles_deg):
                 s = base_scale * mult
                 aligned = place(s, angle)
-                iou = _hard_iou(aligned, ref)
-                if iou > best[2]:
-                    best = (aligned, {"scale": s, "angle_deg": float(angle)}, iou)
+                sc, iou, dists = score(aligned)
+                if sc > best[0]:
+                    best = (sc, iou, aligned, {"scale": s, "angle_deg": float(angle)}, dists)
 
-    aligned, params, iou = best
+    _, iou, aligned, params, dists = best
     params["shift"] = tuple((c_ref - c_tgt).tolist())
     params["area_ratio"] = masked_area(aligned) / max(ref_area, 1e-12)
     params["area_measure"] = "solid_angle" if weights is not None else "pixels"
+    if dists is not None:
+        params["corner_dist_px"] = [float(d) for d in dists]
     return aligned.astype(np.float32), params, iou
 
 

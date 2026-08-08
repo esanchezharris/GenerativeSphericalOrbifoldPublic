@@ -181,17 +181,52 @@ def prepare_target(escher: SphereEscher, ctx: ShapeContext, args) -> torch.Tenso
 
         weights = pixel_solid_angles(ctx.mv, ctx.proj, ctx.size, ctx.size)
 
+    # The four PINNED cone corners (kite domains only): outline points the carve can
+    # never move. Projected here for alignment scoring and for the diagnostics below.
+    corner_px = None
+    mesh = escher.mesh
+    if all(hasattr(mesh, k) for k in ("cone1", "cone2a", "cone2b", "cone3")):
+        idx = [mesh.cone1, mesh.cone2a, mesh.cone3, mesh.cone2b]
+        pts = torch.as_tensor(mesh.points[idx], dtype=torch.float64)
+        with torch.no_grad():
+            corner_px = (
+                project_to_pixels(pts, ctx.mv, ctx.proj, ctx.size, ctx.size)
+                .cpu()
+                .numpy()
+            )
+
     aligned, params, iou = align_mask_to(
         alpha0,
         raw,
         match_area=bool(args.get("MATCH_TILE_AREA", True)),
         pixel_weights=weights,
+        corner_px=corner_px,
+        corner_weight=float(args.get("ALIGN_CORNER_WEIGHT", 0.0)),
+        translation_px=float(args.get("ALIGN_TRANSLATION_SEARCH_PX", 0.0)),
+        translation_steps=int(args.get("ALIGN_TRANSLATION_STEPS", 5)),
     )
     print(
         f"target aligned: scale {params['scale']:.3f}, angle {params['angle_deg']:+.1f} deg, "
         f"initial IoU {iou:.3f}, area ratio {params['area_ratio']:.4f} "
         f"({params['area_measure']})"
     )
+
+    # Step-0 residual split + corner status: where would filler land TODAY?
+    inside_t = aligned > 0.5
+    inside_a = alpha0 > 0.5
+    not_covered = float((inside_t & ~inside_a).sum()) / max(inside_t.sum(), 1)
+    outside_tgt = float((inside_a & ~inside_t).sum()) / max(inside_a.sum(), 1)
+    print(
+        f"step-0 residual: target-not-covered {not_covered:.1%}, "
+        f"tile-outside-target {outside_tgt:.1%}"
+    )
+    if corner_px is not None:
+        status = []
+        for name, (col, row) in zip(("cone1", "cone2a", "cone3", "cone2b"), corner_px):
+            r, c = int(round(row)), int(round(col))
+            ok = 0 <= r < inside_t.shape[0] and 0 <= c < inside_t.shape[1] and inside_t[r, c]
+            status.append(f"{name}={'inside' if ok else 'OUTSIDE'}")
+        print(f"pinned corners vs target: {', '.join(status)}")
 
     import imageio.v2 as imageio
 
@@ -415,9 +450,24 @@ def run_shape(args) -> dict:
 
     target = prepare_target(escher, ctx, args)
 
+    # Optional tau anneal over the final stretch: hard IoU is tau-invariant (the
+    # alpha>0.5 contour is the polygon for ANY tau), but the LOSS's gradient band
+    # narrows and sharpens as tau falls -- right when the residual is a thin
+    # boundary ribbon. Late-only because narrow bands from step 0 risk instability
+    # (raising tau LOWERS peak gradient; see mask_pyramid_loss docstring).
+    base_tau = float(args.MASK_TAU)
+    tau_end = float(args.get("MASK_TAU_END", 0.0) or 0.0)
+    anneal_start = float(args.get("MASK_TAU_ANNEAL_START", 0.8))
+    n_steps = max(int(args.SHAPE_STEPS), 1)
+
     start = time.time()
     info: dict = {}
     for iteration in range(int(args.SHAPE_STEPS) + 1):
+        if tau_end > 0:
+            f = iteration / n_steps
+            if f > anneal_start:
+                t = (f - anneal_start) / max(1.0 - anneal_start, 1e-9)
+                ctx.tau = base_tau + (tau_end - base_tau) * min(t, 1.0)
         info = shape_step(escher, target, ctx, args)
 
         if iteration % 10 == 0:
@@ -480,6 +530,23 @@ def scaled_n_phi(n_phi_k4: int, k: int) -> int:
     return max(n, 5)
 
 
+def _sweep_rank_key(args):
+    """Winner-selection key for sweeps, by SWEEP_RANK_METRIC.
+
+    ``soft`` (default, the historical behavior) ranks by soft IoU with a HIGHER-
+    perimeter tiebreak. ``hard`` ranks by hard IoU -- the number that corresponds
+    to filler on the sphere, free of the tau bias that penalizes articulated
+    outlines (a perfect carve scores ~0.93 soft at tau 3, and the shortfall grows
+    with perimeter) -- with a LOWER-perimeter tiebreak (less filler boundary).
+    """
+    metric = str(args.get("SWEEP_RANK_METRIC", "soft"))
+    if metric == "hard":
+        return lambda r: (r["hard_iou"], -r["boundary_ratio"])
+    if metric != "soft":
+        raise ValueError(f"SWEEP_RANK_METRIC must be 'soft' or 'hard', got {metric!r}")
+    return lambda r: (r["iou"], r["boundary_ratio"])
+
+
 def sweep(args) -> None:
     """Run the shape phase per k; pick by IoU among valid runs (perimeter tiebreak)."""
     results = []
@@ -509,7 +576,7 @@ def sweep(args) -> None:
 
     valid = [r for r in results if r["valid"] and r["flips"] == 0]
     if valid:
-        best = max(valid, key=lambda r: (r["iou"], r["boundary_ratio"]))
+        best = max(valid, key=_sweep_rank_key(args))
         print(f"\nwinner: k={best['k']} (iou {best['iou']:.4f}) -> {best['output_dir']}")
     else:
         print("\nno valid run -- inspect the overlays before rerunning")
@@ -519,13 +586,24 @@ def _sweep_one(cfg: dict) -> dict | None:
     """One candidate screen, in its own process. Module-level so it pickles.
 
     Takes a plain container rather than an ``OmegaConf`` object, and returns ``None``
-    instead of raising when the candidate has no usable foreground, so one bad
-    generation cannot take the pool down.
+    instead of raising, so one bad candidate cannot take the pool down. RuntimeError
+    is caught too -- a solver/adjoint blowup on one candidate used to kill the whole
+    screen -- and the traceback is preserved in the candidate's output dir rather
+    than silenced.
     """
     torch.set_num_threads(1)
     try:
         return run_shape(OmegaConf.create(cfg))
-    except ValueError:
+    except (ValueError, RuntimeError) as e:
+        import traceback
+
+        out = Path(cfg.get("OUTPUT_DIR", "."))
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        except OSError:
+            pass
+        print(f"  {Path(cfg['TARGET_MASK']).stem}: failed ({type(e).__name__}: {e})")
         return None
 
 
@@ -624,14 +702,16 @@ def sweep_targets(args) -> None:
     if not valid:
         print("\nno valid candidate -- inspect the overlays before rerunning")
         return
-    best = max(valid, key=lambda r: (r["iou"], r["boundary_ratio"]))
+    best = max(valid, key=_sweep_rank_key(args))
     chosen = Path(args.TARGET_DIR) / "target.npy"
-    np.save(
-        chosen,
-        load_target_mask(best["target"], int(args.get("TARGET_SMOOTH_RADIUS", 0))),
-    )
+    # Save the winner RAW (no morphology): the production carve applies
+    # TARGET_SMOOTH_RADIUS itself on load, and saving it smoothed here meant the
+    # radius was applied TWICE -- eroding exactly the thin fins that make a fish
+    # read as a fish.
+    np.save(chosen, load_target_mask(best["target"]))
     print(
-        f"\nwinner: {Path(best['target']).stem} (iou {best['iou']:.4f}) -> {chosen}\n"
+        f"\nwinner: {Path(best['target']).stem} (iou {best['iou']:.4f}, "
+        f"hard {best['hard_iou']:.4f}) -> {chosen}\n"
         f"  re-run the full carve with TARGET_MASK={chosen}"
     )
 

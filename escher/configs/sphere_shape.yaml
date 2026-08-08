@@ -19,6 +19,13 @@ MASK_PYRAMID_LEVELS: 7
 # Soft-edge width of the analytic silhouette, in pixels. Gradients live in this band;
 # the pyramid extends their reach (7 levels: 512 -> 8).
 MASK_TAU: 3.0
+# Anneal tau toward MASK_TAU_END over the final (1 - MASK_TAU_ANNEAL_START) fraction
+# of the carve (0 = off). Hard IoU is tau-invariant (the alpha>0.5 contour IS the
+# polygon at any tau), but the loss band narrows and sharpens as tau falls -- right
+# when the residual is a thin boundary ribbon. Late-only: narrow bands from step 0
+# risk instability (raising tau LOWERS peak gradient; see mask_pyramid_loss).
+MASK_TAU_END: 0.0
+MASK_TAU_ANNEAL_START: 0.8
 BOUNDARY_SMOOTH_WEIGHT: 300.0
 BOUNDARY_SPACING_WEIGHT: 1000.0
 LR_BOUNDARY: 0.01
@@ -55,6 +62,17 @@ SOLID_ANGLE_AREA_MATCH: false
 # values coverage per steradian. Experimental; A/B separately from the alignment.
 SOLID_ANGLE_LOSS_WEIGHTING: false
 
+# Pinned-corner-aware alignment (kite domains). The four cone corners can never
+# move; measured on the shipped fish, ALL FOUR sat outside the figure -- each a
+# guaranteed permanent filler spike the alignment was blind to. Weight > 0 scores
+# candidates by iou - w * mean(corner outside-distance)/tile radius. Keep small
+# (0.1-0.3): the carve A/B, not the alignment score, is the arbiter.
+ALIGN_CORNER_WEIGHT: 0.0
+# Offset grid (+-px, on the best rotations) around the centroid-derived placement;
+# the centroid is a moment, not an optimum. 0 = off.
+ALIGN_TRANSLATION_SEARCH_PX: 0
+ALIGN_TRANSLATION_STEPS: 5
+
 # Non-empty (e.g. [4, 6]) runs one shape fit per k into OUTPUT_DIR_k<k> and picks the
 # winner by IoU among certificate-valid runs.
 SWEEP_K: []
@@ -75,6 +93,12 @@ TARGET_AREA_MAX: 0.6
 # Candidate screens are independent solves; 0 = min(8, cores-2). Each worker pins itself
 # to one BLAS thread so the processes do not oversubscribe the machine.
 TARGET_SWEEP_WORKERS: 0
+# Winner selection for sweeps. "soft" = historical (soft IoU, higher-perimeter
+# tiebreak). "hard" = hard IoU (the filler-relevant, tau-free number) with a
+# LOWER-perimeter tiebreak; soft IoU's tau band penalizes articulated outlines by
+# ~4 px of union per unit of perimeter, biasing selection against exactly the
+# candidates this project wants.
+SWEEP_RANK_METRIC: "soft"
 
 # Close-then-open radius applied to the target mask before fitting, in pixels. Diffusion
 # silhouettes arrive with pixel-scale jaggies (visible on the fish target's tail) and the
