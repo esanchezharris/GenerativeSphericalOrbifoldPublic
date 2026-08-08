@@ -176,6 +176,9 @@ PALETTE_HUES_DEG: [0.0, 120.0, -120.0]
 ### output
 OUTPUT_DIR: "output/sphere"
 VISUALIZATION_FREQ: 50
+# Snapshot cadence, decoupled from checkpoints/geometry checks; null = same as
+# VISUALIZATION_FREQ (the historical behavior).
+SNAPSHOT_FREQ: null
 DEVICE: "cuda"
 # Per-phase timing breakdown (escher/misc/timing.py) -> timing.csv beside metrics.csv.
 # Inserts cuda synchronize at phase boundaries, which itself slows the loop -- enable

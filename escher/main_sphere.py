@@ -936,10 +936,14 @@ class SphereEscher:
                     ok, message = self.check_geometry(info["points"])
                 if not ok:
                     print(f"  !! geometry check failed: {message}")
-                with self.timer.phase("snapshot"):
-                    self.save_snapshot(iteration)
                 with self.timer.phase("checkpoint"):
                     self.save_checkpoint(iteration)
+            # Snapshots (2 renders + a matplotlib figure) can be decoupled from the
+            # checkpoint/geometry cadence; default null keeps them in lockstep.
+            snap_freq = int(a.get("SNAPSHOT_FREQ") or a.VISUALIZATION_FREQ)
+            if iteration % snap_freq == 0:
+                with self.timer.phase("snapshot"):
+                    self.save_snapshot(iteration)
 
         self.save_checkpoint(a.N_STEPS)
         print(f"\ndone in {(time.time() - start) / 60:.1f} min -> {self.output_dir}")
