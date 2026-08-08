@@ -89,6 +89,28 @@ def measure(
         DEFAULT_INIT if init_color is None else list(init_color), dtype=np.float32
     )
 
+    # Init-leak is measured STRUCTURALLY, in texture space, where it is exact: a
+    # render-space color-ball test cannot separate leaked init from genuine figure
+    # hues once blending and per-tile hue rotation are involved (measured: 4.9%
+    # "init-like" on a checkpoint with provably ZERO texels in the init ball).
+    from escher.rendering.texture_mask import uv_valid_mask
+
+    valid = uv_valid_mask(
+        escher.mesh.uv, escher.mesh.faces, int(escher.args.TEXTURE_RESOLUTION)
+    )
+    tex_np = escher.texture.detach().cpu().numpy()
+    tex_chroma = tex_np.max(-1) - tex_np.min(-1)
+    tex_luma = tex_np.mean(-1)
+    sampled_white = int(
+        ((tex_chroma < CHROMA_MAX) & (tex_luma > LUMA_MIN) & valid).sum()
+    )
+    sampled_init = int(
+        ((np.linalg.norm(tex_np - init, axis=-1) < INIT_L2) & valid).sum()
+    )
+    unsampled_init = int(
+        ((np.linalg.norm(tex_np - init, axis=-1) < INIT_L2) & ~valid).sum()
+    )
+
     covered = 0
     n_white = 0
     n_init = 0
@@ -123,11 +145,14 @@ def measure(
 
             chroma = img.max(-1) - img.min(-1)
             luma = img.mean(-1)
+            # The render-space gate signal: low-chroma brights genuinely read as
+            # background and are fixed points of the tint rotation.
             white_like = (chroma < CHROMA_MAX) & (luma > LUMA_MIN) & on_sphere
+            # Diagnostic only (untinted single-ball); false-positive-prone.
             init_like = (
                 np.linalg.norm(img - init, axis=-1) < INIT_L2
             ) & on_sphere
-            bg = white_like | init_like
+            bg = white_like
 
             covered += int(on_sphere.sum())
             n_white += int(white_like.sum())
@@ -151,10 +176,16 @@ def measure(
             "init_color": init.tolist(),
         },
         "covered_px": covered,
+        # The gate: white-like render fraction (tint-defeating, truly background).
         "bg_px": n_bg,
         "bg_frac": n_bg / max(covered, 1),
         "bg_white_frac": n_white / max(covered, 1),
-        "bg_init_frac": n_init / max(covered, 1),
+        # Diagnostic only -- see the texture-space leak numbers below for truth.
+        "init_like_render_frac_diagnostic": n_init / max(covered, 1),
+        # Structural leak accounting (exact, texture space, measured post-gutter):
+        "sampled_white_texels": sampled_white,
+        "sampled_init_texels": sampled_init,
+        "unsampled_init_texels": unsampled_init,
     }
 
     out_dir = checkpoint.parent
@@ -170,8 +201,8 @@ def measure(
         ax.set_axis_off()
     fig.suptitle(
         f"background-like pixels (magenta): {100 * result['bg_frac']:.2f}% of sphere"
-        f" -- white-like {100 * result['bg_white_frac']:.2f}%,"
-        f" init-like {100 * result['bg_init_frac']:.2f}%",
+        f" -- sampled white/init texels {sampled_white}/{sampled_init},"
+        f" unsampled init texels {unsampled_init}",
         fontsize=12,
     )
     fig.tight_layout()
@@ -180,8 +211,8 @@ def measure(
 
     print(
         f"bg_frac {100 * result['bg_frac']:.3f}% of {covered} sphere pixels "
-        f"(white-like {100 * result['bg_white_frac']:.3f}%, "
-        f"init-like {100 * result['bg_init_frac']:.3f}%) "
+        f"(white-like render gate) | texels: sampled white {sampled_white}, "
+        f"sampled init {sampled_init}, unsampled init {unsampled_init} "
         f"-> {out_dir / 'background_metrics.json'}"
     )
     return result
