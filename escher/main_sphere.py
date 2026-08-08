@@ -208,6 +208,7 @@ class SphereEscher:
         # should be, on every orbifold.
         self._last_info: dict | None = None
         self._frozen_at: int | None = None
+        self._frozen_cache: dict | None = None
         self.faces_t = torch.as_tensor(self.mesh.faces, dtype=torch.long)
         with torch.no_grad():
             self.ref_areas = spherical_face_areas(self.solve_points(), self.faces_t).detach()
@@ -340,6 +341,34 @@ class SphereEscher:
             return self.embedder(self.b_orb.boundary_b(self.P))
         return self.embedder(self.edge_weights())
 
+    def _frozen_solve(self) -> dict:
+        """Solve ONCE at the freeze latch; reuse the detached result afterwards.
+
+        Valid because the freeze is latched (shape_frozen) and apply_shape_freeze
+        runs before every optimizer.step from the latch on: the shape parameter is
+        bit-frozen, so re-solving produced the identical answer -- 7000 times per
+        texture run, twice per step. Detaching also removes the implicit-function
+        adjoint (one sparse-LU per backward) whose gradient apply_shape_freeze then
+        zeroed unread, and lets nvdiffrast skip its vertex-position/antialias
+        gradient work. Invalidated on checkpoint load.
+        """
+        cache = self._frozen_cache
+        if cache is None:
+            with torch.no_grad():
+                points = self.solve_points()
+            self._frozen_cache = cache = {
+                "points": points.detach(),
+                "flips": count_flipped_faces(
+                    points.detach().cpu().numpy(), self.mesh.faces
+                ),
+                "energy": self.embedder.last_result.energy,
+                "solver_iters": (
+                    self.embedder.last_result.stage1.n_iter
+                    + self.embedder.last_result.stage2.n_iter
+                ),
+            }
+        return cache
+
     def ensure_valid_shape(self) -> tuple[torch.Tensor, int, bool]:
         r"""Solve; if the boundary folded the interior, revert to the last valid ``P``.
 
@@ -412,6 +441,7 @@ class SphereEscher:
         texture: torch.Tensor | None = None,
         tint: torch.Tensor | None = None,
         shade_ambient: float | None = None,
+        points: torch.Tensor | None = None,
     ):
         """Render the tiling, or a single tile alone against the background.
 
@@ -420,8 +450,15 @@ class SphereEscher:
         into the prompt's figure -- with the full tiling every view is completely covered by
         tiles, leaving no silhouette to push on, and only the texture can respond. The planar
         pipeline gets this for free by rendering one fundamental domain.
+
+        ``points`` lets the caller reuse an existing solve (step() passes the one from
+        its validity projection). Without it, the frozen cache is used when the shape
+        is latched -- snapshots and the silhouette pass then cost no extra solves --
+        and only otherwise does the render solve for itself.
         """
-        points = self.solve_points()
+        if points is None:
+            cached = getattr(self, "_frozen_cache", None)
+            points = cached["points"] if cached is not None else self.solve_points()
         group = self.solo_tiler if isolated else self.tiler
         sphere = build_tiled_sphere(
             points.to(self.device).float(), self.mesh.faces, self.mesh.uv, group
@@ -542,9 +579,22 @@ class SphereEscher:
 
         frozen = self.shape_frozen(iteration)
 
-        # Validity projection BEFORE anything uses this step's geometry.
+        # Validity projection BEFORE anything uses this step's geometry. Once frozen
+        # the parameters provably cannot move, so the solve runs once at the latch
+        # and the detached result is reused (_frozen_solve). Unfrozen, the ONE solve
+        # here is passed to render() -- it used to solve again for itself.
         with self.timer.phase("solve"):
-            _, flips, reverted = self.ensure_valid_shape()
+            if frozen:
+                cache = self._frozen_solve()
+                points_in, flips, reverted = cache["points"], cache["flips"], False
+                energy, solver_iters = cache["energy"], cache["solver_iters"]
+            else:
+                points_in, flips, reverted = self.ensure_valid_shape()
+                energy = self.embedder.last_result.energy
+                solver_iters = (
+                    self.embedder.last_result.stage1.n_iter
+                    + self.embedder.last_result.stage2.n_iter
+                )
         if reverted:
             self._n_reverts += 1
             self.reset_shape_optimizer_state()
@@ -555,7 +605,9 @@ class SphereEscher:
         frac = a.ISOLATED_TILE_FRACTION
         isolated = frac > 0 and iteration % max(1, round(1.0 / frac)) == 0
         with self.timer.phase("render"):
-            images, alpha, points = self.render(a.IMAGE_BATCH_SIZE, isolated=isolated)
+            images, alpha, points = self.render(
+                a.IMAGE_BATCH_SIZE, isolated=isolated, points=points_in
+            )
 
         if a.RANDOM_BACKGROUND:
             bg = torch.rand(images.shape[0], 1, 1, 3, device=self.device)
@@ -653,11 +705,8 @@ class SphereEscher:
             "area_spread": area_spread,
             "frozen_at": self._frozen_at,
             "timestep": float(timestep.float().mean()),
-            "energy": self.embedder.last_result.energy,
-            "solver_iters": (
-                self.embedder.last_result.stage1.n_iter
-                + self.embedder.last_result.stage2.n_iter
-            ),
+            "energy": energy,
+            "solver_iters": solver_iters,
             "points": points,
         }
 
@@ -777,6 +826,9 @@ class SphereEscher:
             if not reset_texture:
                 self.texture.copy_(state["texture"].to(self.device))
         self.optimizer.load_state_dict(state["optimizer"])
+        # The loaded parameters need a fresh solve; a cache from before the load
+        # would render the OLD shape forever.
+        self._frozen_cache = None
         return int(state["iteration"])
 
     def save_snapshot(self, iteration: int) -> None:
