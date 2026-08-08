@@ -53,6 +53,38 @@ def test_conf_file_is_an_overlay_not_a_replacement():
     assert args.FREEZE_SHAPE_AFTER == 0  # and the overlay's own keys land
 
 
+def test_sphere_conf_file_chains_overlays_left_to_right():
+    """A phase overlay must be able to carry a second overlay on top of it.
+
+    With one overlay level, ``sphere_texture_octa.yaml`` merges onto sphere.yaml alone
+    and silently loses every sphere_texture.yaml delta it was written to extend -- which
+    is how a texture run once came back with the base prompt, guidance 50 and no TV
+    prior, i.e. exactly the settings the texture phase overrides.
+    """
+    from escher.main_sphere import load_sphere_args
+
+    args = load_sphere_args(
+        OmegaConf.create(
+            {
+                "CONF_FILE": [
+                    "configs/sphere_texture.yaml",
+                    "configs/sphere_texture_octa.yaml",
+                ]
+            }
+        )
+    )
+    assert args.N_STEPS == 7000  # the rightmost overlay wins
+    assert args.CAMERA_DISTANCE == 1.2
+    assert args.GUIDANCE_SCALE == 30.0  # inherited from the middle layer, not base's 50
+    assert args.TEXTURE_TV_WEIGHT == 100.0
+    assert "white icing" in args.PROMPT
+    assert args.TEXTURE_RESOLUTION == 256  # and sphere.yaml's own keys still survive
+
+    # A bare string still works, unchanged.
+    solo = load_sphere_args(OmegaConf.create({"CONF_FILE": "configs/sphere_texture.yaml"}))
+    assert solo.N_STEPS == 1000 and solo.GUIDANCE_SCALE == 30.0
+
+
 # ------------------------------------------------------------------------ weight map
 def test_map_weights_range_and_uniform_start(tmp_path):
     e = tiny_escher(tmp_path)

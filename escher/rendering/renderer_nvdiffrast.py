@@ -37,6 +37,7 @@ def render_mesh_nvdiffrast(
     texture: torch.Tensor = None,  # B,H,W,3
     glctx: dr.RasterizeCudaContext = None,
     vertex_color_mtx: torch.Tensor = None,  # V,9 or B,V,9 -- per-vertex 3x3 color matrix
+    shade_ambient: float = None,  # None = unlit (training); float in [0,1] = diffuse preview
 ) -> torch.Tensor:  # B,H,W,4
     # Number of vertices
     vertices = vertices.to("cuda:0").float()
@@ -127,6 +128,25 @@ def render_mesh_nvdiffrast(
             vcm = vcm.unsqueeze(0)
         mtx, _ = dr.interpolate(vcm.contiguous(), rast_out, faces)  # C,H,W,9
         col = torch.einsum("bhwij,bhwj->bhwi", mtx.reshape(*mtx.shape[:3], 3, 3), col)
+    if shade_ambient is not None:
+        # Diffuse shading, PREVIEW ONLY (never during training -- see render_tiled_sphere).
+        #
+        # Without it a rotating textured sphere is genuinely bistable: with no shape-from-
+        # shading cue the visual system cannot tell a convex sphere turning one way from a
+        # concave one turning the other, and the turntable reads as the INSIDE of the ball.
+        # The geometry was never wrong -- the tiled sphere's signed solid angle is +4pi, so
+        # faces are outward-oriented, and the camera orbits outside it.
+        #
+        # The normal is free here: these vertices lie on the unit sphere, so the outward
+        # normal IS the normalised position. Lighting is fixed in VIEW space, otherwise the
+        # highlight would sweep across the surface as the camera orbits and strobe.
+        n_obj = torch.nn.functional.normalize(vertices, dim=-1)  # B,V,3
+        n_view = torch.einsum("bij,bvj->bvi", mv[:, :3, :3], n_obj)
+        n_view = torch.nn.functional.normalize(n_view, dim=-1)
+        light = torch.tensor([0.35, 0.45, 0.82], device=n_view.device)
+        lam = (n_view @ (light / light.norm())).clamp(min=0.0).unsqueeze(-1)  # B,V,1
+        shade, _ = dr.interpolate(lam.contiguous(), rast_out, faces)  # C,H,W,1
+        col = col * (shade_ambient + (1.0 - shade_ambient) * shade)
     alpha = torch.clamp(rast_out[..., -1:], max=1)  # C,H,W,1
     depth = rast_out[:, :, :, 2]  # C,H,W,1
     # if debugging with depth

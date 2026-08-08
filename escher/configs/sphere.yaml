@@ -40,6 +40,14 @@ KITE_N: 20
 # planar pipeline. Closer to 1 permits more extreme tile deformation.
 W_RANGE: 0.95
 LR_W: 0.03
+# false: W = 0 gives UNIFORM weights (upstream's convention -- correct for their square
+#   grid, which has no prescribed shape).
+# true:  W = 0 gives the reference solver's CLAMPED COTANGENT weights, at which the solve
+#   reproduces the designed lune/kite exactly. Measured on (2,3,4): per-face area spread
+#   82.1 -> 1.4 and drift from the designed mesh 0.143 -> 0.000. Since the kite's UV is
+#   uniform barycentric, that spread is also the texel-density variation across one tile,
+#   i.e. an 82x range in effective per-texel learning rate for the texture phase.
+COTANGENT_RELATIVE_WEIGHTS: false
 
 ### texture
 # One tile covers roughly 250 px of a 512 render, so a 512 texture is ~4x oversampled and
@@ -152,6 +160,12 @@ SDS_MAX_START: 0.98
 SDS_MAX_END: 0.5
 
 ### presentation
+# Ambient floor for the diffuse shading applied to render_final's video and stills
+# (render-time ONLY -- training stays unlit so what SDS sees never changes). Unlit, a
+# rotating textured sphere has no shape-from-shading cue and the turntable reads
+# ambiguously as the concave inside of the ball; this resolves it. `SHADE=0` on the
+# render_final command line restores the flat look.
+SHADE_AMBIENT: 0.55
 # Per-tile hue rotation (escher/rendering/palette.py): neighbors get different palette
 # hues, the alternating-color Escher look. RENDER-TIME ONLY -- snapshots' wide panels and
 # render_final; training always sees identity (tinted training views would push

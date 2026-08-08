@@ -26,7 +26,10 @@ Usage (inside the WSL venv)::
 
 from __future__ import annotations
 
+import multiprocessing
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,7 +39,7 @@ from omegaconf import OmegaConf
 
 from escher.main_sphere import PATH, SphereEscher
 from escher.rendering.camera import orbit_views, perspective, tile_centric_views
-from escher.shape_target import align_mask_to, mask_pyramid_loss, soft_iou
+from escher.shape_target import align_mask_to, binarize_mask, mask_pyramid_loss, soft_iou
 from escher.soft_silhouette import boundary_loop, project_to_pixels, soft_polygon_mask
 from escher.OTE.core.spherical.regularizers import (
     area_margin_loss,
@@ -115,21 +118,33 @@ def soft_alpha(escher: SphereEscher, points: torch.Tensor, ctx: ShapeContext) ->
     return mask.reshape(1, ctx.size, ctx.size, 1)
 
 
-def load_target_mask(path: str | Path) -> np.ndarray:
+def load_target_mask(path: str | Path, smooth_radius: int = 0) -> np.ndarray:
+    """Load an already-binary target mask, optionally de-jaggying its contour.
+
+    ``smooth_radius`` runs the same close-then-open pair as :func:`binarize_mask`; the
+    masks reaching here are binary already, so only the morphology applies. Diffusion
+    contours are ragged at pixel scale and the carve reproduces that raggedness as
+    sawtooth serrations on the tile outline.
+    """
     path = Path(path)
     if path.suffix == ".npy":
-        return np.load(path).astype(np.float32)
-    import imageio.v2 as imageio
+        mask = np.load(path).astype(np.float32)
+    else:
+        import imageio.v2 as imageio
 
-    img = imageio.imread(path).astype(np.float32)
-    if img.ndim == 3:
-        img = img[..., :3].mean(-1)
-    return (img / max(img.max(), 1e-9) > 0.5).astype(np.float32)
+        img = imageio.imread(path).astype(np.float32)
+        if img.ndim == 3:
+            img = img[..., :3].mean(-1)
+        mask = (img / max(img.max(), 1e-9) > 0.5).astype(np.float32)
+    if smooth_radius > 0:
+        # binarize_mask expects the figure DARK on a light ground, so invert in and back.
+        mask = binarize_mask(1.0 - mask, threshold=0.5, smooth_radius=int(smooth_radius))
+    return mask
 
 
 def prepare_target(escher: SphereEscher, ctx: ShapeContext, args) -> torch.Tensor:
     """Align the raw mask over the undeformed tile's silhouette; save the evidence."""
-    raw = load_target_mask(args.TARGET_MASK)
+    raw = load_target_mask(args.TARGET_MASK, int(args.get("TARGET_SMOOTH_RADIUS", 0)))
     with torch.no_grad():
         alpha0 = soft_alpha(escher, escher.solve_points(), ctx)[0, ..., 0].cpu().numpy()
 
@@ -186,10 +201,22 @@ def shape_step(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext, ar
             reg = reg + args.BOUNDARY_MARGIN_WEIGHT * area_margin_loss(
                 points, escher.faces_t, escher.ref_areas, margin=args.BOUNDARY_MARGIN
             )
-    elif args.W_REGULARIZATION > 0:
+    else:
         # The weights-mode priors, mirroring step(): area terms above guard against the
         # C-series degeneracy, this one against sigmoid saturation.
-        reg = reg + args.W_REGULARIZATION * (escher.W**2).sum()
+        if args.W_REGULARIZATION > 0:
+            reg = reg + args.W_REGULARIZATION * (escher.W**2).sum()
+        smooth_w = float(args.get("BOUNDARY_SMOOTH_WEIGHT_W", 0.0))
+        if smooth_w > 0:
+            # Second differences around the boundary loop -- the same term boundary mode
+            # gets from boundary_chain_regularizers and the planar driver applies to its
+            # own loop. Weights mode had NO outline-smoothness prior of any kind, only the
+            # weight and area penalties, so nothing charged for a high-frequency wobble in
+            # the boundary and the carve came back with sawtooth serrations along the
+            # edges (visible as the green excess in the fish overlay).
+            b = points[ctx.loop]
+            second = b.roll(-1, 0) - 2.0 * b + b.roll(1, 0)
+            reg = reg + smooth_w * second.square().sum()
 
     loss = mask + reg.to(mask)
     loss.backward()
@@ -372,6 +399,126 @@ def sweep(args) -> None:
         print("\nno valid run -- inspect the overlays before rerunning")
 
 
+def _sweep_one(cfg: dict) -> dict | None:
+    """One candidate screen, in its own process. Module-level so it pickles.
+
+    Takes a plain container rather than an ``OmegaConf`` object, and returns ``None``
+    instead of raising when the candidate has no usable foreground, so one bad
+    generation cannot take the pool down.
+    """
+    torch.set_num_threads(1)
+    try:
+        return run_shape(OmegaConf.create(cfg))
+    except ValueError:
+        return None
+
+
+def sweep_targets(args) -> None:
+    """Carve against every candidate silhouette; keep the one the tiling can actually be.
+
+    ``make_target.py`` picks a candidate by figure AREA, which says nothing about whether
+    the tiling can adopt that outline. Shapes that tile a surface under a fixed group are
+    a thin subset -- every limb needs a complementary notch in a neighbour -- and Stable
+    Diffusion draws with no such constraint, so a candidate can be a perfect gingerbread
+    man and still be unreachable. Measured: against the area-picked candidate the carve
+    converges to 0.75 and will not move (regularizers off changes it by +0.007), while
+    the same optimizer on a target known to be reachable climbs past 0.87 in 20 steps.
+    Reachability is the binding constraint, so select on it.
+
+    Short carves, since the ranking settles long before convergence. CPU only.
+    """
+    candidates = sorted(Path(args.TARGET_DIR).glob("target_[0-9]*.png"))
+    candidates = [p for p in candidates if not p.stem.endswith("_raw")]
+    if not candidates:
+        raise FileNotFoundError(f"no target_*.png candidates in {args.TARGET_DIR}")
+
+    # Reachability alone is gameable, and measurably so: a candidate whose binarization
+    # failed and covers the whole frame gets area-matched down to a tile-shaped blob and
+    # then "wins" by not deforming at all (measured on (2,3,4): candidates 1/2/6 scored
+    # IoU 0.757 at boundary_ratio 1.019, against 0.729 for the real figure). So keep
+    # make_target.py's plausibility band as a gate and rank by IoU only within it.
+    lo, hi = float(args.TARGET_AREA_MIN), float(args.TARGET_AREA_MAX)
+    plausible = []
+    for path in candidates:
+        area = float(load_target_mask(path).mean())
+        if lo <= area <= hi:
+            plausible.append(path)
+        else:
+            print(f"  {path.stem}: figure area {area:.3f} outside [{lo}, {hi}] -- skipped")
+    if not plausible:
+        raise ValueError(f"no candidate in {args.TARGET_DIR} has a plausible figure area")
+    candidates = plausible
+
+    cfgs = [
+        OmegaConf.to_container(
+            OmegaConf.merge(
+                args,
+                {
+                    "TARGET_MASK": str(path),
+                    "OUTPUT_DIR": f"{args.OUTPUT_DIR}_{path.stem}",
+                    "SHAPE_STEPS": int(args.TARGET_SWEEP_STEPS),
+                    "SWEEP_TARGETS": False,
+                    "SWEEP_K": [],
+                },
+            ),
+            resolve=True,
+        )
+        for path in candidates
+    ]
+
+    # Candidates are completely independent solves, so screening them is embarrassingly
+    # parallel -- and it was running one at a time on one of 12 cores. Each worker pins
+    # itself to a single BLAS thread, otherwise N processes each spawn N threads and
+    # oversubscribe the machine into being slower than sequential.
+    workers = int(args.get("TARGET_SWEEP_WORKERS", 0)) or min(8, max(1, (os.cpu_count() or 2) - 2))
+    workers = max(1, min(workers, len(cfgs)))
+    print(f"screening {len(cfgs)} candidates on {workers} worker(s)")
+
+    results = []
+    if workers == 1:
+        pairs = [(c, _sweep_one(c)) for c in cfgs]
+    else:
+        # SPAWN, not fork: the parent has already run autograd by the time a sweep starts,
+        # and forking after that raises "Unable to handle autograd's threading in
+        # combination with fork-based multiprocessing". Spawn re-imports this module in
+        # each child, which is why _sweep_one is module-level and takes a plain container.
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+            pairs = list(zip(cfgs, pool.map(_sweep_one, cfgs)))
+    for cfg, r in pairs:
+        if r is None:  # binarize_mask rejected an all-background candidate
+            print(f"  {Path(cfg['TARGET_MASK']).stem}: skipped (no usable foreground)")
+            continue
+        r["target"] = cfg["TARGET_MASK"]
+        results.append(r)
+
+    lines = ["target,iou,boundary_ratio,area_spread,flips,valid,output_dir"]
+    for r in results:
+        lines.append(
+            f"{Path(r['target']).stem},{r['iou']:.4f},{r['boundary_ratio']:.4f},"
+            f"{r['area_spread']:.1f},{r['flips']},{r['valid']},{r['output_dir']}"
+        )
+    Path(f"{args.OUTPUT_DIR}_targets.csv").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+    print("\n" + "\n".join(lines))
+
+    valid = [r for r in results if r["valid"] and r["flips"] == 0]
+    if not valid:
+        print("\nno valid candidate -- inspect the overlays before rerunning")
+        return
+    best = max(valid, key=lambda r: (r["iou"], r["boundary_ratio"]))
+    chosen = Path(args.TARGET_DIR) / "target.npy"
+    np.save(
+        chosen,
+        load_target_mask(best["target"], int(args.get("TARGET_SMOOTH_RADIUS", 0))),
+    )
+    print(
+        f"\nwinner: {Path(best['target']).stem} (iou {best['iou']:.4f}) -> {chosen}\n"
+        f"  re-run the full carve with TARGET_MASK={chosen}"
+    )
+
+
 def main() -> None:
     cli = OmegaConf.from_cli()
     conf_file = cli.pop("CONF_FILE", "configs/sphere_shape.yaml")
@@ -384,7 +531,9 @@ def main() -> None:
     if conf_file != "configs/sphere_shape.yaml":
         layers.append(OmegaConf.load(PATH / conf_file))
     args = OmegaConf.merge(*layers, cli)
-    if args.SWEEP_K:
+    if args.get("SWEEP_TARGETS", False):
+        sweep_targets(args)
+    elif args.SWEEP_K:
         sweep(args)
     else:
         run_shape(args)

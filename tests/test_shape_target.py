@@ -39,6 +39,45 @@ def test_binarize_keeps_largest_component_and_fills_holes():
     assert abs(area - np.pi * 30**2) / (np.pi * 30**2) < 0.05
 
 
+def test_smoothing_strips_jaggies_but_keeps_a_thin_tail():
+    """The de-jaggy pass must remove contour noise without eating real thin features.
+
+    Diffusion silhouettes arrive with pixel-scale raggedness and the carve fits it
+    faithfully, returning it as sawtooth serrations on the tile outline. But a fish's tail
+    fin is also thin, and over-smoothing would delete the very feature that makes the
+    figure legible -- so this pins both directions at the radius we ship.
+    """
+    img = np.ones((128, 128))
+    body = disk(img.shape, (64, 56), 26)
+    tail = np.zeros_like(body)
+    tail[60:69, 82:112] = True  # 9 px thick: thin, but a genuine feature
+    img[body | tail] = 0.1
+    # Sawtooth along the body's lower edge, the shape of what SD actually produces.
+    for x in range(40, 90, 4):
+        img[82:86, x : x + 2] = 0.1
+
+    rough = binarize_mask(img)
+    smooth = binarize_mask(img, smooth_radius=3)
+
+    def boundary_roughness(mask):
+        """Perimeter over that of an equal-area disk -- scale-free jaggedness."""
+        per = np.logical_xor(mask > 0.5, ndimage.binary_erosion(mask > 0.5)).sum()
+        return per / (2.0 * np.sqrt(np.pi * (mask > 0.5).sum()))
+
+    assert boundary_roughness(smooth) < boundary_roughness(rough)
+    # The tail survives: still connected to the body and still reaching to the right.
+    assert smooth[64, 100] > 0.5, "smoothing erased the thin tail"
+    assert ndimage.label(smooth > 0.5)[1] == 1, "smoothing detached the tail"
+    # And the figure's overall extent is essentially unchanged.
+    assert abs(smooth.sum() - rough.sum()) / rough.sum() < 0.15
+
+
+def test_smoothing_is_a_noop_at_radius_zero():
+    img = np.ones((64, 64))
+    img[disk(img.shape, (32, 32), 14)] = 0.1
+    assert np.array_equal(binarize_mask(img), binarize_mask(img, smooth_radius=0))
+
+
 def test_binarize_explicit_threshold_overrides_otsu():
     img = np.ones((32, 32))
     img[disk(img.shape, (16, 16), 8)] = 0.4
