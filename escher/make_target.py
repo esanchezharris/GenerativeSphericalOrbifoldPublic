@@ -42,6 +42,7 @@ DEFAULTS = OmegaConf.create(
         "SIZE": 512,
         "OUT_DIR": "assets/targets/gingerbread",
         "CHOOSE": -1,  # >= 0: skip generation, just re-point target.npy
+        "DEVICE": "cuda",
     }
 )
 
@@ -53,22 +54,28 @@ def write_choice(out_dir: Path, index: int) -> None:
     print(f"target.npy <- candidate {index} (area {mask.mean():.3f} of frame)")
 
 
-def generate(args) -> None:
+def generate(args) -> dict:
+    """Generate candidates; returns ``{"chosen": index, "areas": [...], "out_dir"}``.
+
+    Raises ``ValueError`` when no candidate binarizes cleanly (the CLI shim maps it
+    to a nonzero exit); a driver can catch it per job.
+    """
     import torch
     from diffusers import StableDiffusionPipeline
 
     out_dir = Path(args.OUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    device = str(args.get("DEVICE", "cuda"))
     pipe = StableDiffusionPipeline.from_pretrained(
         args.MODEL, torch_dtype=torch.float16, safety_checker=None,
         requires_safety_checker=False,
-    ).to("cuda")
+    ).to(device)
     pipe.set_progress_bar_config(disable=True)
 
     candidates = []  # (index, raw, mask-or-None, area)
     for i in range(args.N):
-        gen = torch.Generator(device="cuda").manual_seed(args.SEED + i)
+        gen = torch.Generator(device=device).manual_seed(args.SEED + i)
         raw = pipe(
             args.PROMPT,
             negative_prompt=args.NEGATIVE,
@@ -109,9 +116,14 @@ def generate(args) -> None:
     # chose exactly that, so the band is load-bearing.
     valid = [(i, a) for i, _, m, a in candidates if m is not None and 0.08 <= a <= 0.6]
     if not valid:
-        raise SystemExit("no candidate binarized cleanly -- adjust PROMPT and rerun")
+        raise ValueError("no candidate binarized cleanly -- adjust PROMPT and rerun")
     best = max(valid, key=lambda t: t[1])[0]
     write_choice(out_dir, best)
+    return {
+        "chosen": best,
+        "areas": [a for _, _, _, a in candidates],
+        "out_dir": str(out_dir),
+    }
 
 
 def main() -> None:
@@ -119,7 +131,10 @@ def main() -> None:
     if args.CHOOSE >= 0:
         write_choice(Path(args.OUT_DIR), int(args.CHOOSE))
     else:
-        generate(args)
+        try:
+            generate(args)
+        except ValueError as e:
+            raise SystemExit(2) from e
 
 
 if __name__ == "__main__":

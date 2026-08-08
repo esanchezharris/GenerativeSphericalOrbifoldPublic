@@ -179,6 +179,9 @@ VISUALIZATION_FREQ: 50
 # Snapshot cadence, decoupled from checkpoints/geometry checks; null = same as
 # VISUALIZATION_FREQ (the historical behavior).
 SNAPSHOT_FREQ: null
+# Keep only the newest N step-tagged checkpoints (-1 = keep all, historical).
+# checkpoint.pt (the latest) always survives.
+KEEP_CHECKPOINTS: -1
 DEVICE: "cuda"
 # Per-phase timing breakdown (escher/misc/timing.py) -> timing.csv beside metrics.csv.
 # Inserts cuda synchronize at phase boundaries, which itself slows the loop -- enable

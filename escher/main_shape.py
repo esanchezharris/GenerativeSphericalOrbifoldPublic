@@ -351,15 +351,18 @@ def evaluate_shape(escher: SphereEscher, target: torch.Tensor, ctx: ShapeContext
     }
 
 
-def log_shape_metrics(output_dir: Path, iteration: int, info: dict) -> None:
+def log_shape_metrics(
+    output_dir: Path, iteration: int, info: dict, fresh: bool = False
+) -> None:
     """Own CSV, own header: ``log_metrics``'s header is hardcoded for the SDS loop.
 
     ``hard_iou`` is appended LAST: tests and downstream parsers index the earlier
-    columns by position.
+    columns by position. ``fresh`` truncates -- a re-run into an existing dir used
+    to concatenate two histories with no separator.
     """
     path = output_dir / "metrics.csv"
-    new = not path.exists()
-    with open(path, "a", encoding="utf-8") as f:
+    new = fresh or not path.exists()
+    with open(path, "w" if fresh else "a", encoding="utf-8") as f:
         if new:
             f.write(
                 "step,loss,mask,iou,area_reg,karcher,"
@@ -471,7 +474,7 @@ def run_shape(args) -> dict:
         info = shape_step(escher, target, ctx, args)
 
         if iteration % 10 == 0:
-            log_shape_metrics(escher.output_dir, iteration, info)
+            log_shape_metrics(escher.output_dir, iteration, info, fresh=iteration == 0)
             per_step = (time.time() - start) / max(iteration, 1)
             print(
                 f"step {iteration:5d} | loss {info['loss']:9.1f} | "
@@ -607,8 +610,11 @@ def _sweep_one(cfg: dict) -> dict | None:
         return None
 
 
-def sweep_targets(args) -> None:
+def sweep_targets(args) -> dict | None:
     """Carve against every candidate silhouette; keep the one the tiling can actually be.
+
+    Returns the winning result dict (with ``winner_path``), or ``None`` when no
+    candidate was valid -- the CLI maps that to exit code 2.
 
     ``make_target.py`` picks a candidate by figure AREA, which says nothing about whether
     the tiling can adopt that outline. Shapes that tile a surface under a fixed group are
@@ -653,6 +659,12 @@ def sweep_targets(args) -> None:
                     "SHAPE_STEPS": int(args.TARGET_SWEEP_STEPS),
                     "SWEEP_TARGETS": False,
                     "SWEEP_K": [],
+                    # The screen is CPU work by design, but sphere_shape*.yaml
+                    # inherit DEVICE cuda from sphere.yaml -- measured: up to 8
+                    # spawned workers each building its own CUDA context (and
+                    # firing nvdiffrast snapshot renders) on the "CPU-parallel"
+                    # stage. Screens carry no GPU-worthy work; pin them to CPU.
+                    "DEVICE": "cpu",
                 },
             ),
             resolve=True,
@@ -701,9 +713,14 @@ def sweep_targets(args) -> None:
     valid = [r for r in results if r["valid"] and r["flips"] == 0]
     if not valid:
         print("\nno valid candidate -- inspect the overlays before rerunning")
-        return
+        return None
     best = max(valid, key=_sweep_rank_key(args))
-    chosen = Path(args.TARGET_DIR) / "target.npy"
+    # WINNER_OUT redirects the winner mask to a run-local path; the legacy default
+    # overwrites the shared, committed TARGET_DIR/target.npy in place -- a mutable
+    # rendezvous two concurrent figures would race on.
+    winner_out = args.get("WINNER_OUT", None)
+    chosen = Path(winner_out) if winner_out else Path(args.TARGET_DIR) / "target.npy"
+    chosen.parent.mkdir(parents=True, exist_ok=True)
     # Save the winner RAW (no morphology): the production carve applies
     # TARGET_SMOOTH_RADIUS itself on load, and saving it smoothed here meant the
     # radius was applied TWICE -- eroding exactly the thin fins that make a fish
@@ -714,26 +731,38 @@ def sweep_targets(args) -> None:
         f"hard {best['hard_iou']:.4f}) -> {chosen}\n"
         f"  re-run the full carve with TARGET_MASK={chosen}"
     )
+    return {**best, "winner_path": str(chosen)}
 
 
 def main() -> None:
     cli = OmegaConf.from_cli()
     conf_file = cli.pop("CONF_FILE", "configs/sphere_shape.yaml")
-    # sphere.yaml -> sphere_shape.yaml -> CONF_FILE (if different) -> CLI, so overlays
-    # like sphere_shape_weights.yaml stay small deltas on the shape defaults.
+    # sphere.yaml -> sphere_shape.yaml -> CONF_FILE overlays (left to right) -> CLI,
+    # so overlays like sphere_shape_weights.yaml stay small deltas on the shape
+    # defaults. Accepts a LIST like main_sphere's loader; a list used to TypeError.
+    conf_files = [conf_file] if isinstance(conf_file, str) else list(conf_file)
     layers = [
         OmegaConf.load(PATH / "configs/sphere.yaml"),
         OmegaConf.load(PATH / "configs/sphere_shape.yaml"),
     ]
-    if conf_file != "configs/sphere_shape.yaml":
-        layers.append(OmegaConf.load(PATH / conf_file))
+    layers += [
+        OmegaConf.load(PATH / f)
+        for f in conf_files
+        if f != "configs/sphere_shape.yaml"
+    ]
     args = OmegaConf.merge(*layers, cli)
+    # Exit codes are the batch driver's failure vocabulary: 2 = no valid screen
+    # candidate, 3 = carve finished but failed the geometry certificate. Both used
+    # to exit 0 with the failure visible only in stdout.
     if args.get("SWEEP_TARGETS", False):
-        sweep_targets(args)
+        if sweep_targets(args) is None:
+            raise SystemExit(2)
     elif args.SWEEP_K:
         sweep(args)
     else:
-        run_shape(args)
+        result = run_shape(args)
+        if not result["valid"]:
+            raise SystemExit(3)
 
 
 if __name__ == "__main__":

@@ -776,16 +776,17 @@ class SphereEscher:
             tuple(self.mesh.boundary_chains),
         )
 
-    def log_metrics(self, iteration: int, info: dict) -> None:
-        """Append one row to ``metrics.csv``.
+    def log_metrics(self, iteration: int, info: dict, fresh: bool = False) -> None:
+        """Append one row to ``metrics.csv``; ``fresh`` truncates first.
 
         Written by the process itself rather than scraped from stdout: a previous run's log
         was piped through a tail-only filter at launch and the history was lost, taking the
-        matched-step comparison with it.
+        matched-step comparison with it. A from-scratch run into an existing dir used to
+        CONCATENATE two histories with no separator; an in-place resume still appends.
         """
         path = self.output_dir / "metrics.csv"
-        new = not path.exists()
-        with open(path, "a", encoding="utf-8") as f:
+        new = fresh or not path.exists()
+        with open(path, "w" if fresh else "a", encoding="utf-8") as f:
             if new:
                 f.write(
                     "step,loss,silhouette,area_reg,karcher,"
@@ -826,6 +827,15 @@ class SphereEscher:
         tagged = self.output_dir / f"checkpoint_{iteration:06d}.pt"
         torch.save(payload, tagged)
         torch.save(payload, self.output_dir / "checkpoint.pt")
+        # Retention: keep the newest KEEP_CHECKPOINTS tagged files (-1 = all, the
+        # historical behavior). checkpoint.pt always survives. A 64-candidate
+        # screen was writing ~400 MB of tagged checkpoints nothing ever read.
+        keep = int(self.args.get("KEEP_CHECKPOINTS", -1))
+        if keep >= 0:
+            tagged_all = sorted(self.output_dir.glob("checkpoint_*.pt"))
+            drop = tagged_all[:-keep] if keep > 0 else tagged_all
+            for old in drop:
+                old.unlink(missing_ok=True)
         return tagged
 
     def load_checkpoint(self, path: str | Path, reset_texture: bool = False) -> int:
@@ -898,35 +908,49 @@ class SphereEscher:
         plt.close(fig)
 
     # -------------------------------------------------------------------------- loop
-    def run(self, resume_from: str | Path | None = None) -> None:
+    def run(
+        self,
+        resume_from: str | Path | None = None,
+        start_step: int | None = None,
+    ) -> None:
         """Optimise. With ``resume_from``, continue an interrupted run in place.
 
         Long runs are ~1 hour, so losing one to an interruption is expensive; checkpoints
         were already being written every ``VISUALIZATION_FREQ`` steps but nothing consumed
         them.
+
+        ``start_step`` overrides the checkpoint's step counter -- the cross-phase
+        handoff (shape checkpoint at 1500 into a texture run) needs to start its OWN
+        schedule at 0, and without the override a shape checkpoint at or past
+        N_STEPS silently no-opped. A no-op resume is now an error (exit 5), never a
+        silent success.
         """
         a = self.args
         first_step = 0
         if resume_from is not None:
-            first_step = (
-                self.load_checkpoint(
-                    resume_from,
-                    reset_texture=a.get("RESET_TEXTURE_ON_RESUME", False),
-                )
-                + 1
+            loaded = self.load_checkpoint(
+                resume_from,
+                reset_texture=a.get("RESET_TEXTURE_ON_RESUME", False),
             )
-            print(f"resuming from {resume_from} at step {first_step}")
+            first_step = loaded + 1 if start_step is None else int(start_step)
+            print(
+                f"resuming from {resume_from} (checkpoint step {loaded}) "
+                f"at step {first_step}"
+            )
             if first_step >= a.N_STEPS:
-                print("checkpoint is already at or past N_STEPS; nothing to do")
-                return
+                raise SystemExit(5)
 
         start = time.time()
         last_print = (start, first_step)
+        first_log = True
         for iteration in range(first_step, a.N_STEPS + 1):
             info = self.step(iteration)
 
             if iteration % 10 == 0:
-                self.log_metrics(iteration, info)
+                # Truncate only when this run STARTS the history (step 0); an
+                # in-place resume keeps appending to its own file.
+                self.log_metrics(iteration, info, fresh=first_log and first_step == 0)
+                first_log = False
                 if self.timer.enabled:
                     self.log_timing(iteration)
                 now = time.time()
@@ -989,7 +1013,11 @@ def load_sphere_args(cli):
 def main() -> None:
     cli = OmegaConf.from_cli()
     resume = cli.pop("RESUME", None)
-    SphereEscher(load_sphere_args(cli)).run(resume_from=resume)
+    start_step = cli.pop("START_STEP", None)
+    SphereEscher(load_sphere_args(cli)).run(
+        resume_from=resume,
+        start_step=None if start_step is None else int(start_step),
+    )
 
 
 if __name__ == "__main__":
