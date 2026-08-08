@@ -92,6 +92,12 @@ class SphereEscher:
     # ------------------------------------------------------------------------- setup
     def _init_geometry(self):
         a = self.args
+        # Rasterizer choice for the cached default context; runs here because every
+        # construction path (train, shape phase, render_final) passes through
+        # _init_geometry, unlike __init__.
+        from escher.rendering.renderer_nvdiffrast import set_default_context_kind
+
+        set_default_context_kind(str(a.get("RASTER_CONTEXT", "gl")))
         if a.PARAM_MODE == "boundary":
             # Free side of the cut as direct parameters; interior follows a fixed-boundary
             # cotangent solve. Dihedral (k,2,2) on the lune by default; ORBIFOLD_CONES

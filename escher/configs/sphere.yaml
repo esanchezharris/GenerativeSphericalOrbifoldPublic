@@ -181,3 +181,7 @@ DEVICE: "cuda"
 # Inserts cuda synchronize at phase boundaries, which itself slows the loop -- enable
 # only when measuring, never for production runs.
 TIMING: false
+# Rasterizer for the cached default nvdiffrast context: "gl" reproduces every prior
+# run bit-identically; "cuda" is a different rasterizer implementation (edge pixels
+# may differ at exact coverage ties) -- opt-in A/B only.
+RASTER_CONTEXT: "gl"
