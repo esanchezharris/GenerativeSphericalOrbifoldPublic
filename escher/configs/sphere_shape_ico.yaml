@@ -1,0 +1,32 @@
+# (2,3,5) ICOSAHEDRAL shape phase -- overlay on sphere.yaml + sphere_shape.yaml.
+# 60 tiles: the figure density of the concept image, where (4,2,2)'s 8 tiles read as
+# continents and (2,3,4)'s 24 still fall short. The kite machinery is generic over
+# spherical triples -- measured, all three pass the same gates (order 60, feasibility
+# 1e-16, fold-free across two orders of weight magnitude, certificate at 1.4e-15
+# relative error), so this is a config, not new math.
+
+PARAM_MODE: "weights"
+ORBIFOLD_CONES: [2, 3, 5]
+KITE_N: 20
+
+# Framing. A (2,3,5) tile has 1/60 of the sphere against (2,3,4)'s 1/24 -- 2.5x less
+# solid angle, ~1.58x smaller linearly -- so the (2,3,4) framing would leave the tile
+# small in frame, and "tile too small / tile fills the frame" has produced a flat mask
+# loss twice in this project. Distance is bounded below by the unit sphere, so the knob
+# is FOV: 40 / 1.58 ~= 25. VERIFY against step_00000.png before trusting any metric.
+SHAPE_CAMERA_DISTANCE: 2.4
+CAMERA_FOV: 26.0
+
+LR_W: 0.03
+W_RANGE: 0.95
+MASK_LOSS_WEIGHT: 5000.0
+
+# Weights-mode priors (see sphere_shape_weights.yaml). Retuned by the planar ablation.
+EQUAL_AREA_WEIGHT: 500.0
+AREA_TAIL_WEIGHT: 800.0
+AREA_TAIL_FRACTION: 0.05
+W_REGULARIZATION: 0.02
+
+SHAPE_STEPS: 600
+SWEEP_K: []
+OUTPUT_DIR: "output/sphere_shape_ico"

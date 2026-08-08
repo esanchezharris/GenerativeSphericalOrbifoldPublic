@@ -80,7 +80,11 @@ def export_mesh(escher: SphereEscher, out_dir: Path) -> None:
 
 
 def render_turntable(
-    escher: SphereEscher, out_dir: Path, n_frames: int = 120, tint: torch.Tensor | None = None
+    escher: SphereEscher,
+    out_dir: Path,
+    n_frames: int = 120,
+    tint: torch.Tensor | None = None,
+    shade: float | None = None,
 ) -> None:
     with torch.no_grad():
         points = escher.solve_points()
@@ -99,6 +103,7 @@ def render_turntable(
                 mv=mv,
                 image_size=escher.args.RENDER_SIZE,
                 tile_color_matrices=tint,
+                shade_ambient=shade,
             )
             comp = (images * alpha + 1.0 * (1 - alpha)).clamp(0, 1).cpu().numpy()
             frames.extend((f * 255).astype(np.uint8) for f in comp)
@@ -139,9 +144,18 @@ def main() -> None:
         tint = tile_color_matrices(escher.tiler, escher.mesh, hues)
         print(f"tinting {escher.tiler.order} tiles with hue palette {hues}")
 
+    # Diffuse shading for the video and stills. Without it the turntable is genuinely
+    # ambiguous -- a rotating textured sphere carries no shape-from-shading cue, so it
+    # reads as easily as the concave inside of the ball as the convex outside. SHADE=0
+    # restores the old flat look; training renders are never shaded either way.
+    shade = None
+    if "SHADE=0" not in sys.argv[2:]:
+        shade = float(escher.args.get("SHADE_AMBIENT", 0.55))
+        print(f"shading previews with ambient {shade}")
+
     out_dir = checkpoint.parent
     export_mesh(escher, out_dir)
-    render_turntable(escher, out_dir, tint=tint)
+    render_turntable(escher, out_dir, tint=tint, shade=shade)
 
 
 if __name__ == "__main__":

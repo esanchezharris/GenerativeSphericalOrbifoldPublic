@@ -152,6 +152,13 @@ class SphereEscher:
 
     def _init_parameters(self):
         a = self.args
+        # Needed before ref_areas below, which solves through edge_weights().
+        from escher.geometry.cotangent_weights import cotan_edge_weights
+
+        self._cotan_weights = torch.as_tensor(
+            cotan_edge_weights(self.mesh.points, self.mesh.faces, self.mesh.edges),
+            dtype=torch.float64,
+        )
         # Both modes report reverts (weights mode simply never increments it).
         self._n_reverts = 0
         if a.PARAM_MODE == "boundary":
@@ -178,15 +185,26 @@ class SphereEscher:
             [shape_group, {"params": [self.texture], "lr": a.LR_TEXTURE}]
         )
 
-        # Reference state for the equal-area regularizer: the undeformed lune's own
-        # per-face solid angles (its faces legitimately differ in size).
+        # Reference state for the equal-area regularizer: the per-face solid angles of
+        # the state the run actually STARTS in -- the uniform-weight solve -- not the raw
+        # fundamental-domain mesh layout.
+        #
+        # These are not the same configuration, and on the kites they are far apart: the
+        # solve moves vertices by up to 0.15 on the unit sphere and rescales faces by
+        # 0.054x-9.27x on (2,3,5) (0.068x-5.53x on (2,3,4), 0.43x-1.46x on the lune).
+        # Referencing the raw layout therefore charged a drift penalty at step 0 for
+        # drift that had not happened, and the barrier spent the optimizer's budget
+        # dragging the shape toward a configuration that does not solve the system.
+        # Measured on (2,3,5): reg 6960 against mask 6080 at step 0, IoU pinned at 0.6169
+        # and perimeter at exactly 1.0000x -- the carve could not move at all. With the
+        # reference below both area terms are exactly 0 at step 0, as a drift penalty
+        # should be, on every orbifold.
         self._last_info: dict | None = None
         self._frozen_at: int | None = None
         self.faces_t = torch.as_tensor(self.mesh.faces, dtype=torch.long)
-        self.ref_areas = spherical_face_areas(
-            torch.as_tensor(self.mesh.points, dtype=torch.float64), self.faces_t
-        ).detach()
-        assert (self.ref_areas > 0).all(), "undeformed mesh must be fold-free"
+        with torch.no_grad():
+            self.ref_areas = spherical_face_areas(self.solve_points(), self.faces_t).detach()
+        assert (self.ref_areas > 0).all(), "the uniform-weight solve must be fold-free"
 
     def _init_guidance(self):
         import escher.guidance.sd as sd
@@ -234,9 +252,49 @@ class SphereEscher:
 
     # -------------------------------------------------------------------------- step
     def edge_weights(self) -> torch.Tensor:
-        """Map the free parameters into ``[r, 1-r]``, strictly positive as Tutte requires."""
+        r"""Map the free parameters to strictly positive Tutte weights.
+
+        Two conventions, selected by ``COTANGENT_RELATIVE_WEIGHTS``.
+
+        **Absolute** (upstream, and what this project shipped): ``sigmoid(W)`` affinely
+        mapped into ``[r, 1-r]``, so ``W = 0`` gives 0.5 on every edge -- UNIFORM weights.
+        That convention is inherited from Generative Escher Meshes, whose base mesh is a
+        square grid with no prescribed shape: any positive weights give a valid planar
+        embedding and upstream never cares what the identity configuration looks like.
+
+        It does not transfer. Our fundamental domain is a specific object with prescribed
+        cone angles, and the reference solver (``Solver.m``) builds its system from
+        ``cotmatrix(V,T)`` -- cotangent weights, at which the base mesh is its own harmonic
+        fixed point. Measured cost of the mismatch, uniform vs cotangent:
+
+        ==============  ==================  ==================  ================
+        domain          area spread         drift from mesh     UV texel stretch
+        ==============  ==================  ==================  ================
+        lune (4,2,2)    42.0  ->  17.9      0.395  ->  0.0008   42x  ->  17.9x
+        kite (2,3,4)    82.1  ->   1.4      0.143  ->  0.0000   82x  ->   1.4x
+        kite (2,3,5)   171.7  ->   1.2      0.130  ->  0.0000  172x  ->   1.2x
+        ==============  ==================  ==================  ================
+
+        So the "undeformed" tile was never the designed kite, and because the kite's UV is
+        uniform barycentric, that area spread is also the texel-density variation across a
+        single tile -- score distillation deposits gradient per texel in proportion to the
+        screen area it covers, so an 82x density range is an 82x range in effective
+        learning rate across one tile.
+
+        **Cotangent-relative**: ``w = w_cot * (sigmoid(W) * W_RANGE + r) / 0.5``, so
+        ``W = 0`` reproduces the reference configuration exactly and ``W`` modulates around
+        it. This also removes a representability problem: the absolute map spans a fixed
+        ratio (39:1 at ``W_RANGE`` 0.95) while the cotangent weights themselves need
+        107:1 on (2,3,4) and 306:1 on (2,3,5) -- the natural configuration was literally
+        outside the parameterization. Only ratios matter here, since the Karcher energy
+        ``E = sum w_ij d_ij^2`` is invariant to a global scale of ``w`` (verified: uniform
+        0.5 and uniform 1.0 agree to 5e-12).
+        """
         r = (1.0 - self.args.W_RANGE) / 2.0
-        return torch.special.expit(self.W) * self.args.W_RANGE + r
+        mult = torch.special.expit(self.W) * self.args.W_RANGE + r
+        if not self.args.get("COTANGENT_RELATIVE_WEIGHTS", False):
+            return mult
+        return self._cotan_weights * (mult / 0.5)
 
     @property
     def shape_param(self) -> torch.nn.Parameter:
@@ -346,6 +404,7 @@ class SphereEscher:
         isolated: bool = False,
         texture: torch.Tensor | None = None,
         tint: torch.Tensor | None = None,
+        shade_ambient: float | None = None,
     ):
         """Render the tiling, or a single tile alone against the background.
 
@@ -379,6 +438,10 @@ class SphereEscher:
             fovy_deg=self.args.CAMERA_FOV,
             mv=mv,
             tile_color_matrices=tint,
+            # Shading is a presentation-only cue, exactly like `tint`: training passes
+            # leave both off so what SDS sees is unchanged and every prior run stays
+            # comparable.
+            shade_ambient=shade_ambient,
         )
         return images, alpha, points
 
@@ -760,17 +823,30 @@ class SphereEscher:
         print(f"\ndone in {(time.time() - start) / 60:.1f} min -> {self.output_dir}")
 
 
+def load_sphere_args(cli):
+    """sphere.yaml -> each CONF_FILE overlay, left to right -> CLI.
+
+    ``CONF_FILE`` is an OVERLAY on the base config (``sphere_texture.yaml`` holds only
+    its phase's deltas), so the base always loads first, and it accepts a **list**.
+    A single overlay level is a trap: an orbifold-specific config built on top of the
+    texture phase gets merged onto ``sphere.yaml`` alone and silently drops every delta
+    it meant to inherit -- prompt, negative prompt, guidance, TV weight, texture init.
+    Measured by losing exactly those and getting back the high-frequency texture they
+    exist to prevent.
+    """
+    conf_file = cli.pop("CONF_FILE", "configs/sphere.yaml")
+    conf_files = [conf_file] if isinstance(conf_file, str) else list(conf_file)
+    layers = [OmegaConf.load(PATH / "configs/sphere.yaml")]
+    layers += [
+        OmegaConf.load(PATH / f) for f in conf_files if f != "configs/sphere.yaml"
+    ]
+    return OmegaConf.merge(*layers, cli)
+
+
 def main() -> None:
     cli = OmegaConf.from_cli()
-    conf_file = cli.pop("CONF_FILE", "configs/sphere.yaml")
     resume = cli.pop("RESUME", None)
-    # CONF_FILE is an OVERLAY on the base config (sphere_texture.yaml holds only its
-    # phase's deltas), so the base always loads first.
-    layers = [OmegaConf.load(PATH / "configs/sphere.yaml")]
-    if conf_file != "configs/sphere.yaml":
-        layers.append(OmegaConf.load(PATH / conf_file))
-    args = OmegaConf.merge(*layers, cli)
-    SphereEscher(args).run(resume_from=resume)
+    SphereEscher(load_sphere_args(cli)).run(resume_from=resume)
 
 
 if __name__ == "__main__":

@@ -37,5 +37,37 @@ SHAPE_CAMERA_DISTANCE: 2.8
 # winner by IoU among certificate-valid runs.
 SWEEP_K: []
 
+# true: short-carve every target_*.png candidate in TARGET_DIR and rewrite target.npy
+# with whichever the tiling can actually adopt. make_target.py's own auto-pick sorts by
+# figure area, which is unrelated to reachability -- and reachability is what binds
+# (measured: the area-picked candidate plateaus at IoU 0.75 with the regularizers off,
+# while a known-reachable target passes 0.87 within 20 steps).
+SWEEP_TARGETS: false
+TARGET_DIR: "assets/targets/gingerbread"
+TARGET_SWEEP_STEPS: 150   # the ranking settles well before convergence
+# Plausibility gate, same band make_target.py uses. Required: a candidate whose
+# binarization failed and covers the frame is area-matched into a tile-shaped blob and
+# then scores top IoU without deforming at all.
+TARGET_AREA_MIN: 0.08
+TARGET_AREA_MAX: 0.6
+# Candidate screens are independent solves; 0 = min(8, cores-2). Each worker pins itself
+# to one BLAS thread so the processes do not oversubscribe the machine.
+TARGET_SWEEP_WORKERS: 0
+
+# Close-then-open radius applied to the target mask before fitting, in pixels. Diffusion
+# silhouettes arrive with pixel-scale jaggies (visible on the fish target's tail) and the
+# carve reproduces them as sawtooth serrations on the tile outline. Keep it small -- it
+# erodes genuinely thin features (a fin, a limb) before it runs out of jaggies. 0 = off.
+TARGET_SMOOTH_RADIUS: 3
+
+# Second-difference penalty on the boundary loop in WEIGHTS mode. Boundary mode has had
+# its own smoothness term all along (boundary_chain_regularizers); weights mode had none
+# at all, so nothing charged for a high-frequency wobble in the outline.
+# Bracketed on the fish at 1500 steps (IoU / perimeter): 0 -> 0.7644 / 1.263,
+# 100 -> 0.7644 / 1.221, 500 -> 0.7668 / 1.159, 2000 -> 0.7664 / 1.087. 500 is the best
+# fit AND removes the serrations; by 2000 the perimeter is collapsing toward the
+# undeformed tile's 1.0, i.e. the fins are being rounded off.
+BOUNDARY_SMOOTH_WEIGHT_W: 500.0
+
 OUTPUT_DIR: "output/sphere_shape"
 VISUALIZATION_FREQ: 25

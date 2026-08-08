@@ -1,0 +1,35 @@
+# (2,3,4) texture phase at the UPSTREAM step budget -- overlay on sphere_texture.yaml.
+#
+# BOTH overlays must be listed, in order; CONF_FILE takes a list and applies it left to
+# right on top of sphere.yaml. Naming only this file would merge it onto the BASE config
+# and silently discard sphere_texture.yaml's prompt, negative prompt, guidance 30, TV
+# prior and tan init -- which is how the first attempt at this run produced exactly the
+# high-frequency texture those settings exist to prevent.
+#
+#   python escher/main_sphere.py \
+#       "CONF_FILE=[configs/sphere_texture.yaml,configs/sphere_texture_octa.yaml]" \
+#       RESUME=output/octa_final/checkpoint.pt OUTPUT_DIR=output/octa_tex
+#
+# Every knob below other than the schedule is copied from the shipped run
+# (output/sphere_tex_woctab, read back from its checkpoint), so this is a controlled A/B
+# on step count alone: 1400 -> 7000. Generative Escher Meshes runs 7000 and we never
+# have; the texture reading as scribble rather than a figure is the open complaint, and
+# an under-run schedule is the first thing to rule out before touching guidance, TV, or
+# resolution.
+
+PARAM_MODE: "weights"
+ORBIFOLD_CONES: [2, 3, 4]
+KITE_N: 20
+
+# Tile-scaled training framing. 1.4 (the 8-tile value) painted medallions on the kite;
+# 1.2 restored figures -- measured, keep it.
+CAMERA_DISTANCE: 1.2
+ISOLATED_DISTANCE: 2.4
+
+# The schedule, and the only deliberate change. Anneal ends at ~5/7 of the run, the same
+# fraction the 1400/1200 run used late-polish for -- composition on high-noise samples
+# first, detail on low-noise ones after.
+N_STEPS: 7000
+SDS_ANNEAL_END: 5000
+
+OUTPUT_DIR: "output/octa_tex"

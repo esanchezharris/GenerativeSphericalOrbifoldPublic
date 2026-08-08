@@ -120,6 +120,73 @@ def test_run_shape_weights_mode(tmp_path):
     assert all(r.split(",")[9] == "0" for r in rows[1:]), "reverts must stay 0"
 
 
+def test_weights_mode_smoothness_penalises_a_wobbly_outline(tmp_path):
+    """The term must actually charge for boundary wobble, and be off by default.
+
+    Weights mode shipped with NO outline-smoothness prior of any kind -- only the weight
+    and area penalties -- so nothing opposed a high-frequency wobble and the carve came
+    back with sawtooth serrations. Boundary mode has had such a term all along.
+    """
+    from escher.main_shape import make_context, shape_step
+
+    args = tiny_args(tmp_path)
+    args.PARAM_MODE = "weights"
+    escher = build_shape_run(args)
+    ctx = make_context(escher, args)
+    target = torch.as_tensor(np.load(args.TARGET_MASK), device=escher.device)
+    target = torch.nn.functional.interpolate(
+        target[None, None], size=(ctx.size, ctx.size), mode="nearest"
+    )[0, 0]
+
+    args.BOUNDARY_SMOOTH_WEIGHT_W = 0.0
+    off = shape_step(escher, target, ctx, args)["area_reg"]
+
+    escher2 = build_shape_run(args)
+    args.BOUNDARY_SMOOTH_WEIGHT_W = 1000.0
+    on = shape_step(escher2, target, ctx, args)["area_reg"]
+
+    assert on > off, "the smoothness term must contribute to the regulariser"
+
+    # And it is a genuine second-difference energy: a wobbly loop costs more than a
+    # smooth one of the same length scale.
+    t = torch.linspace(0, 2 * np.pi, 64, dtype=torch.float64)[:-1]
+    smooth = torch.stack([t.cos(), t.sin(), torch.zeros_like(t)], -1)
+    wobbly = smooth * (1.0 + 0.05 * torch.sin(12 * t))[:, None]
+
+    def energy(b):
+        return float((b.roll(-1, 0) - 2 * b + b.roll(1, 0)).square().sum())
+
+    assert energy(wobbly) > 3 * energy(smooth)
+
+
+def test_sweep_targets_ranking_is_worker_count_independent(tmp_path):
+    """Parallelising the candidate screen must not change which candidate wins."""
+    import imageio.v2 as imageio
+
+    from escher.main_shape import sweep_targets
+
+    tdir = tmp_path / "cands"
+    tdir.mkdir()
+    yy, xx = np.meshgrid(np.arange(64), np.arange(64), indexing="ij")
+    for i, r in enumerate((10, 14, 18)):
+        m = ((yy - 32) ** 2 + (xx - 32) ** 2 <= r * r).astype(np.uint8) * 255
+        imageio.imwrite(tdir / f"target_{i:02d}.png", m)
+
+    def run(workers):
+        args = tiny_args(tmp_path)
+        args.PARAM_MODE = "weights"
+        args.SWEEP_TARGETS = True
+        args.TARGET_DIR = str(tdir)
+        args.TARGET_SWEEP_STEPS = 2
+        args.TARGET_SWEEP_WORKERS = workers
+        args.OUTPUT_DIR = str(tmp_path / f"sw{workers}")
+        sweep_targets(args)
+        rows = Path(f"{args.OUTPUT_DIR}_targets.csv").read_text().strip().splitlines()[1:]
+        return [(r.split(",")[0], round(float(r.split(",")[1]), 4)) for r in rows]
+
+    assert run(1) == run(3)
+
+
 def test_scaled_n_phi():
     assert scaled_n_phi(19, 4) == 19
     assert scaled_n_phi(19, 6) == 13

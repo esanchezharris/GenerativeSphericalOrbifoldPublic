@@ -11,20 +11,19 @@
 
 ---
 
-Give it a prompt ("gingerbread man") and it produces a closed spherical surface tiled
-with that figure in the style of M.C. Escher — every tile interlocking with its
-neighbors, no gaps and no overlaps, certified: the tiled mesh's signed solid angles sum
-to exactly 4π with zero inverted faces.
+Give it a prompt ("a fish with scales and fins") and it produces a closed spherical
+surface tiled with that figure in the style of M.C. Escher — the tile's **outline is the
+figure**, every tile interlocking with its neighbors, no gaps and no overlaps, certified:
+the tiled mesh's signed solid angles sum to exactly 4π with zero inverted faces.
 
 Built on **[Generative Escher Meshes](https://github.com/thibaultgroueix/GenerativeEscherMeshes)**
 (Aigerman &amp; Groueix, SIGGRAPH 2024 — [paper](https://arxiv.org/abs/2309.14564)),
 extended from flat wallpaper tilings to closed spherical surfaces using
 **[Spherical Orbifold Tutte Embeddings](https://github.com/noamaig/spherical_orbifolds)**
-(Aigerman &amp; Lipman, SIGGRAPH 2017). The leftmost image above is the project's
-original 2024 concept; the other three are actual outputs of this code — two spheres
-(the dihedral and octahedral orbifolds, tile outlines carved by full-mesh deformation
-through the differentiable Karcher solve) and a planar torus tiling from the same
-mechanism, which also runs the original planar pipeline.
+(Aigerman &amp; Lipman, SIGGRAPH 2017). Every image above is an actual output of this
+code, on the octahedral `(2,3,4)` orbifold — 24 tiles, outlines carved by full-mesh
+deformation through the differentiable Karcher solve. The pipeline is prompt-driven, not
+tuned to one figure: the fish and the gingerbread run differ only in their text prompt.
 
 ## How it works
 
@@ -38,14 +37,18 @@ mechanism, which also runs the original planar pipeline.
    cut **boundary points** directly. Either way, one side of the cut is free and the
    other is *generated* by the symmetry group, so tiles interlock by construction.
 
-2. **Shape.** A clean figure silhouette is generated once with full Stable Diffusion
-   denoising, aligned over the undeformed tile with its **area matched to the tile's**
-   (a tile's area is pinned at `4π/|G|`, so an undersized target caps the achievable
-   overlap structurally — measured, this was the binding constraint before area
-   matching), and the parameters are optimized to match it with a deterministic mask
-   loss. The tile silhouette is computed analytically from the projected boundary
-   polygon, so the shape phase needs no renderer and no diffusion model in the loop,
-   and runs in about two minutes.
+2. **Shape.** Figure silhouettes are generated once with full Stable Diffusion denoising,
+   then **screened by reachability**: shapes that can tile a surface under a fixed
+   symmetry group are a thin subset (every limb needs a complementary notch in a
+   neighbour), and a diffusion model draws with no such constraint. So the pipeline
+   carves a short trial against each candidate and keeps whichever the tiling can
+   actually adopt — measured, that is worth more than the choice of figure. The winner is
+   aligned over the undeformed tile with its **area matched to the tile's** (a tile's area
+   is pinned at `4π/|G|`, so an undersized target caps overlap structurally) and fitted
+   with a deterministic mask loss. The tile silhouette is computed analytically from the
+   projected boundary polygon, so the shape phase needs no renderer and no diffusion model
+   in the loop; a carve takes about two minutes and candidate screening runs in parallel
+   across cores.
 
 3. **Texture.** With the shape frozen, one shared texture is trained by score
    distillation (SDS) against the prompt through a differentiable renderer
@@ -62,23 +65,32 @@ optimization folding steps are projected back to the valid set.
 
 ## Running it
 
+This reproduces the fish sphere above end to end (~70 min, most of it step 4):
+
 ```bash
-# 1. generate silhouette target candidates (GPU, ~1 min; CHOOSE=i re-picks)
-python escher/make_target.py
+# 1. generate silhouette candidates (GPU, ~9 min for 64)
+python escher/make_target.py OUT_DIR=assets/targets/fish N=64 \
+    PROMPT="a plain solid black silhouette of a fish with rounded fins and a broad tail, white background, minimal flat logo, centered, full body"
 
-# 2. carve the tile outline to the chosen target (CPU-capable, ~2 min).
-#    Full-mesh weights mode (best results):
-python escher/main_shape.py CONF_FILE=configs/sphere_shape_weights.yaml
+# 2. screen them by REACHABILITY and keep the best (CPU, parallel, ~4 min for 64)
 python escher/main_shape.py CONF_FILE=configs/sphere_shape_weights.yaml \
-    "ORBIFOLD_CONES=[2,3,4]" SHAPE_CAMERA_DISTANCE=2.4     # octahedral, 24 tiles
-#    Boundary-explicit mode: python escher/main_shape.py    (sphere_shape.yaml)
+    "ORBIFOLD_CONES=[2,3,4]" SHAPE_CAMERA_DISTANCE=2.4 COTANGENT_RELATIVE_WEIGHTS=true \
+    SWEEP_TARGETS=true TARGET_DIR=assets/targets/fish
 
-# 3. train the texture on the frozen shape (GPU, ~8 min)
-python escher/main_sphere.py CONF_FILE=configs/sphere_texture.yaml PARAM_MODE=weights \
-    RESUME=output/sphere_shape_weights/checkpoint.pt OUTPUT_DIR=output/sphere_tex
+# 3. carve the tile outline to the winner (CPU, ~2 min)
+python escher/main_shape.py CONF_FILE=configs/sphere_shape_weights.yaml \
+    "ORBIFOLD_CONES=[2,3,4]" SHAPE_CAMERA_DISTANCE=2.4 COTANGENT_RELATIVE_WEIGHTS=true \
+    TARGET_MASK=assets/targets/fish/target.npy SHAPE_STEPS=1500 OUTPUT_DIR=output/fish_shape
 
-# 4. deliverables: turntable video, textured OBJ, contact sheet
-python escher/render_final.py output/sphere_tex/checkpoint.pt TINT=1
+# 4. train the shared texture on the frozen shape (GPU, ~50 min)
+python escher/main_sphere.py \
+    "CONF_FILE=[configs/sphere_texture.yaml,configs/sphere_texture_octa.yaml]" \
+    COTANGENT_RELATIVE_WEIGHTS=true RESUME=output/fish_shape/checkpoint.pt \
+    PROMPT="a fish with scales and fins, flat vector illustration, solid pastel colors, simple shapes, a masterpiece" \
+    OUTPUT_DIR=output/fish_tex
+
+# 5. deliverables: shaded turntable, textured OBJ, contact sheet
+python escher/render_final.py output/fish_tex/checkpoint.pt TINT=1
 
 # Planar (the original wallpaper-group pipeline, same shape mechanism):
 python escher/main_shape_planar.py                          # carve on the torus
@@ -90,26 +102,61 @@ Configs live in `escher/configs/` (`sphere.yaml` base; `sphere_shape.yaml`,
 `planar_texture.yaml` phase overlays). The test suite (`pytest tests/`, 270+ tests)
 runs entirely on CPU, including both shape-phase optimizations end to end.
 
-## Results and current limitations
+## Results
 
-Measured on the gingerbread target (soft IoU of the tile silhouette against the
-area-matched target mask; perimeter relative to the undeformed tile):
+Soft IoU of the tile silhouette against the area-matched target mask; perimeter relative
+to the undeformed tile. All on `(2,3,4)`, 24 tiles, unless noted.
 
 | Run | IoU | Perimeter | Certificate |
 |---|---|---|---|
-| Sphere `(4,2,2)`, full-mesh weights | 0.797 | 1.479× | 4π at 0.0e+00, 0 folds |
-| Sphere `(2,3,4)`, 24 tiles | 0.712 | 1.313× | 4π at 4.1e-10, 0 folds |
+| **Fish** (`output/texF_fish`) | **0.814** | 1.200× | 4π at 2.3e-13, 0 folds |
+| Gingerbread man | 0.737 | 1.442× | 4π at 1.2e-13, 0 folds |
+| Sphere `(4,2,2)`, 8 tiles | 0.798 | 1.444× | 4π at 0.0e+00, 0 folds |
 | Plane, torus | 0.751 | — | fold-free (planar Tutte guarantee) |
 
-What is solid: the geometry is certified valid in every run, the tiles interlock by
-construction with strongly articulated outlines, and the whole shape phase is
-deterministic and reproducible. What is honestly not there yet: the SDS textures read
-as decorated cookie tiles rather than unmistakable gingerbread figures — outline
-articulation is strong, but the figure semantics *inside* each tile remain the open
-gap between these renders and the concept image. Known levers, untried for compute
-reasons: the upstream pipeline's full 7000-step schedule (ours ran 1000–1400), higher
-shared-texture resolution, and the planar joint phase with `GLOBAL_AFFINE: false`
-(with it on, the global map drifts into a shear).
+Four things moved the needle, in the order we found them:
+
+**The step budget.** Score distillation needs the full 7000-step schedule. At 1400 the
+texture is coloured stipple; the same run at 7000 resolves into clean icing, scales and
+eyes. Nothing before the timestep anneal completes predicts the final result — an earlier
+run was abandoned at step 1100 over blobs that were the prompt's *candy buttons*, still
+forming.
+
+**Cotangent initialization.** The reference solver builds its system from `cotmatrix`;
+our weights mode started from *uniform* weights, so `W = 0` was not the fundamental domain
+we designed but a harmonic distortion of it — per-face areas spread **82×** on the kite.
+Since the UV is uniform barycentric that is also the texel-density range across one tile,
+i.e. an 82× spread in effective per-texel learning rate. Referencing the solve instead
+(`COTANGENT_RELATIVE_WEIGHTS`) drops it to **1.4×** and cut final texture loss by 24%.
+
+**Reachability, not figure choice.** Shapes that tile under a fixed group are a thin
+subset, and a diffusion model draws with no such constraint. Screening 64 candidates and
+keeping the most *reachable* one is worth **+0.052 IoU** — more than the entire
+fish-vs-gingerbread gap (+0.036). Selecting on figure area instead, as the generator's own
+heuristic does, picked a loser every time we checked.
+
+**A figure the group can adopt.** Measured best IoU by prompt: fish 0.762, leaf 0.741,
+gingerbread 0.726, bird 0.696, **lizard 0.659** — despite lizards being *the* Escher motif.
+That is the lesson rather than a contradiction: Escher *designed* his figures around the
+tiling constraint. Note also that fish at 0.762 reads unmistakably as fish while
+gingerbread at 0.726 reads as a decorated star — **IoU is a weak proxy for legibility**.
+What matters is where the residual error lands. A fish tolerates a fattened body; a
+humanoid does not tolerate missing limbs.
+
+## Current limitations
+
+The gingerbread man remains the honest failure case: at its reachability ceiling the tiles
+read as decorated cookies rather than figures. `configs/` keeps the alternative for that
+case — a smaller `ISOLATED_DISTANCE` makes score distillation paint a recognizable figure
+*inside* each tile instead of icing its border (`output/texD_figure_in_tile`), which is
+less Escher-pure but more legible.
+
+Untried levers: an area-preserving (authalic) rather than harmonic UV, texel-density
+normalization of the accumulated texture gradients, and a VSD-style objective. On that
+last one — lowering the guidance scale *without* switching objectives fails outright
+(measured: CFG 12 collapsed the texture to flat stipple). Vanilla SDS needs high guidance
+to overcome its own gradient variance; VSD is what makes low CFG viable, so the two must
+move together.
 
 ## What's here
 
@@ -122,9 +169,11 @@ shared-texture resolution, and the planar joint phase with `GLOBAL_AFFINE: false
 - `escher/geometry/` — fundamental-domain meshes (lune + kite), the spherical tiler
   for all four rotation-group families, and the signed-solid-angle certificate.
 - `escher/shape_target.py` / `escher/soft_silhouette.py` — the deterministic shape
-  loss: target binarization, area-matched alignment, and the analytic soft silhouette
-  (the rasterizer's alpha carries no vertex gradients — measured; the analytic
-  polygon does).
+  loss: target binarization and de-jaggying, area-matched alignment, and the analytic
+  soft silhouette (the rasterizer's alpha carries no vertex gradients — measured; the
+  analytic polygon does).
+- `escher/geometry/cotangent_weights.py` — the reference solver's clamped cotangent
+  weights, shared by both parameterizations so the two cannot drift apart again.
 - `escher/main_shape.py` / `escher/main_shape_planar.py` / `escher/main_sphere.py` /
   `escher/main.py` / `escher/render_final.py` — the pipeline stages, sphere and plane.
 - `escher/rendering/palette.py` — the per-tile hue rotation and the tiling adjacency

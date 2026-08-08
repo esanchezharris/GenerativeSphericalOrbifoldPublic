@@ -87,6 +87,7 @@ def render_tiled_sphere(
     glctx=None,
     generator: torch.Generator | None = None,
     tile_color_matrices: Tensor | None = None,
+    shade_ambient: float | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Render ``n_views`` images of the tiled sphere.
 
@@ -95,6 +96,13 @@ def render_tiled_sphere(
         mv: explicit ``(B, 4, 4)`` view matrices; if omitted, a fresh spread of random views.
         tile_color_matrices: optional ``(G, 3, 3)`` per-tile color transform
             (:mod:`escher.rendering.palette`); ``None`` renders exactly as before.
+        shade_ambient: ``None`` renders unlit, exactly as training does and must continue
+            to. A float in ``[0, 1]`` adds view-space diffuse shading at that ambient
+            floor -- PREVIEWS AND DELIVERABLES ONLY. Unlit, a rotating textured sphere has
+            no shape-from-shading cue and reads as ambiguously convex or concave; lighting
+            it fixes the illusion. It must never reach the SDS passes, or the diffusion
+            model starts optimising the texture against a shading gradient that the shared
+            atlas cannot represent consistently across tiles.
 
     Returns:
         ``(images, alpha)`` with images ``(B, H, W, 3)`` and alpha ``(B, H, W, 1)``.
@@ -136,5 +144,6 @@ def render_tiled_sphere(
         texture=texture,
         glctx=glctx,
         vertex_color_mtx=vertex_color_mtx,
+        shade_ambient=shade_ambient,
     )
     return rgba[..., :3], rgba[..., 3:4]

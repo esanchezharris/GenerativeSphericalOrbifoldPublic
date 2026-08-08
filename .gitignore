@@ -7,3 +7,9 @@ venv/
 
 output/
 *.mp4
+
+# Silhouette candidates: make_target.py regenerates these (step 1 of the README recipe),
+# and a 64-wide search is ~25 MB of PNGs. The chosen target.npy IS committed, so the
+# carve and texture steps run standalone.
+assets/targets/*/target_*.png
+assets/targets/*/contact_sheet.png

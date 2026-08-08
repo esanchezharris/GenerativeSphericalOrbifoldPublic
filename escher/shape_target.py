@@ -48,13 +48,23 @@ def _otsu_threshold(gray: np.ndarray) -> float:
     return float(edges[int(np.argmax(variance)) + 1])
 
 
-def binarize_mask(image: np.ndarray, threshold: float | None = None) -> np.ndarray:
+def binarize_mask(
+    image: np.ndarray, threshold: float | None = None, smooth_radius: int = 0
+) -> np.ndarray:
     """A generated silhouette image -> a clean binary figure mask (float32, {0, 1}).
 
     Convention: the figure is DARK on a light background (matching the silhouette
     prompt). Diffusion output is never perfectly clean, so after thresholding keep only
     the largest connected component (drops speckle and stray marks) and fill interior
     holes (icing details rendered as white).
+
+    ``smooth_radius`` > 0 additionally closes then opens the mask with a disk of that
+    radius. Diffusion silhouettes arrive with ragged, pixel-scale jaggies along the
+    contour -- clearly visible on the fish target's tail and lower edge -- and the shape
+    phase fits them faithfully, so they come back as sawtooth serrations on the tile
+    outline. Closing first fills notches, opening then removes spurs, and the pair leaves
+    the figure's overall extent alone. Keep the radius small: it will erode genuinely thin
+    features (a tail fin, a limb) before it runs out of jaggies to remove.
     """
     gray = _to_grayscale(image)
     if threshold is None:
@@ -68,6 +78,22 @@ def binarize_mask(image: np.ndarray, threshold: float | None = None) -> np.ndarr
         sizes = ndimage.sum_labels(mask, labels, index=np.arange(1, n + 1))
         mask = labels == (1 + int(np.argmax(sizes)))
     mask = ndimage.binary_fill_holes(mask)
+
+    if smooth_radius > 0:
+        r = int(smooth_radius)
+        yy, xx = np.mgrid[-r : r + 1, -r : r + 1]
+        disk = (xx**2 + yy**2) <= r * r
+        mask = ndimage.binary_closing(mask, structure=disk)
+        mask = ndimage.binary_opening(mask, structure=disk)
+        # Opening can split off a fragment; keep the body, and re-fill any notch the
+        # closing opened up.
+        labels, n = ndimage.label(mask)
+        if n > 1:
+            sizes = ndimage.sum_labels(mask, labels, index=np.arange(1, n + 1))
+            mask = labels == (1 + int(np.argmax(sizes)))
+        mask = ndimage.binary_fill_holes(mask)
+        if not mask.any():
+            raise ValueError(f"binarize_mask: smooth_radius {r} erased the figure")
     return mask.astype(np.float32)
 
 
@@ -94,7 +120,13 @@ def align_mask_to(
     reference: np.ndarray,
     target: np.ndarray,
     scales: tuple[float, float, int] = (0.6, 1.3, 15),
-    angles_deg: tuple[float, float, int] = (-90.0, 90.0, 25),
+    # Full circle at the same 7.5-degree step. A half-turn range assumes the tile has a
+    # symmetry that makes +t and t-180 equivalent, and the kites do not: the (2,3,4)
+    # carve selected exactly +90.0, i.e. it was pinned at the edge of its own grid and
+    # the true optimum lay outside. (The range was widened once before, from +-30, for
+    # the same reason -- an alignment sitting on a grid boundary is never a fit, it is a
+    # truncation.)
+    angles_deg: tuple[float, float, int] = (-180.0, 180.0, 49),
     match_area: bool = False,
 ) -> tuple[np.ndarray, dict, float]:
     """Place ``target`` over ``reference`` by a similarity transform, maximizing IoU.
@@ -169,11 +201,21 @@ def soft_iou(alpha: Tensor, target: Tensor) -> Tensor:
 def mask_pyramid_loss(alpha: Tensor, target: Tensor, levels: int = 5) -> Tensor:
     """Multi-scale MSE between rendered alpha ``(B, H, W, 1)`` and the target ``(H, W)``.
 
-    The pyramid is load-bearing, not a nicety: nvdiffrast's alpha carries gradients only
-    in the antialiased EDGE pixels, so a plain per-pixel loss is nearly gradient-dead
-    whenever the rendered and target boundaries are more than a pixel apart. Average
-    pooling widens the soft edge at each level, so coarse levels see misalignments the
-    fine levels cannot, and their gradients point the right way from far away.
+    The pyramid helps, but NOT for the reason originally recorded here. That rationale --
+    coarse levels reaching misalignments the fine levels cannot -- was written for the
+    rasterized alpha this loss was first built against, where pooling hard 0/1 pixels
+    genuinely manufactures a coverage gradient. It does not carry over to the analytic
+    ``soft_polygon_mask``, and long-range reach was never the mechanism anyway: that
+    mask's soft band is centered on the MOVING polygon, so every boundary vertex always
+    sits in its own band and always feels whether the target is 1 or 0 just outside it,
+    however far the target's structure extends.
+
+    What the pyramid actually does is amplify. Measured on the real target from the
+    area-matched start (196 boundary vertices, 84 of them more than 20 px from the target
+    outline): peak vertex gradient rises monotonically with depth -- 7.6e-2 (1 level),
+    2.3e-1 (3), 4.0e-1 (5), 6.0e-1 (7), 6.1e-1 (9) -- while the share of gradient
+    magnitude carried by those far vertices barely moves (45% -> 52%). Raising ``tau``
+    instead *lowers* peak gradient, which is why there is no tau schedule here.
     """
     a = alpha.permute(0, 3, 1, 2)  # (B, 1, H, W)
     t = target.to(a).reshape(1, 1, *target.shape).expand(a.shape[0], -1, -1, -1)

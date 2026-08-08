@@ -209,12 +209,9 @@ class BoundaryExplicitDihedral:
         even starts, which silently folded run B1 and made runs B2/B3 reject ~100% of steps.
         With cotangent weights the same solve reproduces the lune to min ratio **0.998**.
         """
-        import igl
+        from escher.geometry.cotangent_weights import cotan_edge_weights
 
-        L = igl.cotmatrix(self.mesh.points, self.mesh.faces.astype(np.int64))
-        w = np.asarray(L[self.mesh.edges[:, 0], self.mesh.edges[:, 1]]).ravel()
-        w[w < 1e-3] = 1e-3  # Solver.m's clamp for the occasional negative cotangent
-        return w
+        return cotan_edge_weights(self.mesh.points, self.mesh.faces, self.mesh.edges)
 
     def tiler(self) -> SphericalTiler:
         return SphericalTiler.dihedral(self.mesh.k)
